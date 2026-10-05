@@ -1,0 +1,186 @@
+# TG-Threader-Bot — Brief v3 (forward batch)
+
+Status: **agreed** (user + TL, 05.10). Replaces brief v2 entirely.
+
+## 1. Core idea
+
+A moderator of the **source** chat selects messages manually and forwards
+them as a **batch into the thread chat**. The bot turns the batch into a
+thread (template header + reply chain), then **cleans the originals in
+the source chat**.
+
+The v2 live-capture flow (buffer trigger, `/thread` as a reply to the
+anchor, steps 8–9) is **cancelled**. The only thing that survives from
+the buffer is live observation of the source chat (see §5).
+
+## 2. Configuration
+
+- **"source → thread" pairs live only in the config** (`chats.json`,
+  pair format as before: `{"pairs": [{"source": …, "target": …}]}`).
+  No dynamic memory: the TL side will later attach a **settings menu**
+  to the pairs (the bot is public; the config must stay machine-readable).
+- **The bot is an admin in BOTH chats of a pair**, with
+  `can_delete_messages` in both (mandatory in the source chat: it deletes
+  other people's messages).
+- The bot operates **only** in configured thread chats; all other chats
+  are ignored completely.
+
+## 3. Flow
+
+### Step 1. The batch
+
+A source-chat admin selects messages → forwards them as one operation
+into the thread chat. The bot (in a configured thread chat, from an
+admin) accumulates the sequence of forwards into a **pending state**
+(one per chat).
+
+### Step 2. The source
+
+- `forward_origin` carries a chat (channel/group) **and a pair is
+  configured** → **proceed silently**;
+- `forward_origin` carries a chat, **no pair** → ask;
+- user origin (no chat visible — the typical forward-from-a-user case)
+  → ask.
+
+The question (as a reply to the first message of the batch):
+`Which chat did you forward from? Reply with @username or its id.`
+
+The admin's answer is checked against the config:
+
+- **not configured → STOP**: no thread, no cleanup;
+  reply `This chat is not configured as a source chat.`, state resets;
+- configured → the source pair is pinned at step 5.
+
+### Step 3. Thread title
+
+Always (after "where from?" or without it) — as a reply to the first
+message of the batch:
+`Thread title? Send the title as a plain message.`
+
+- **Any thread-chat admin** may answer (others' text is ignored);
+- empty title → `Title is empty — send the thread title.` (keep waiting);
+- longer than 128 characters → truncation (existing logic);
+- `/cancel` from an admin → the bot deletes its own question messages,
+  replies `Cancelled.`, the batch stays untouched (state reset).
+
+### Step 4. Thread assembly (thread chat)
+
+1. `send_message` — header: `Topic: <b>{title}</b>` (title escaped);
+2. `edit_message_text` of the same message — adds
+   `Please use <a href="{thread_url}">this link</a> to respond to this thread.`;
+3. placing the batch **as replies to the header** (flat chain, in
+   original send order):
+   - elements sharing a `media_group_id` → **one `sendMediaGroup` call**
+     (chunks ≤10) with `reply_parameters` to the header; captions and
+     `caption_entities` from the originals, media by the originals'
+     `file_id` (no re-upload) → **albums stay glued**;
+   - single messages → `copy_message(..., reply_to_message_id=header)`;
+   - types unsupported by `sendMediaGroup` or a call error →
+     **fallback**: item-by-item copies (thread still completes, unglued);
+4. `delete_message` of every **original forward** in the thread chat;
+5. deleting its own question messages;
+6. the reply to the moderator (one message, via render/escape):
+   - `Thread created: {n} message(s). {thread_url}`
+   - `Deleted {x} of {y} original messages.` (step 5, see below)
+
+### Step 5. Source-chat cleanup
+
+Only **after successful assembly** (order: thread first, cleanup second —
+if assembly failed, the originals are not touched).
+
+Finding each original:
+
+- **channel origin** → directly by `forward_origin.message_id`
+  (chat id matched the pair);
+- otherwise → by the pair **(date from `forward_origin`,
+  text/caption)** among source-chat messages **the bot saw live**
+  (buffer since startup); media without text → **(date +
+  `file_unique_id`)**;
+- found → `delete_message`; not found → skip;
+- `delete_message` failure → counted as "not found", the flow does not
+  break.
+
+The `Deleted {x} of {y}.` total — **partial success is normal**
+(confirmed).
+
+**Bot API limitation:** there is no history (no `getHistory`) — messages
+sent **before the bot started** cannot be found → `Deleted 0 of Y`.
+Key point to relay to TL: cleanup works only against live-seen messages
++ channel ids.
+
+## 4. Failures and limits
+
+- batch >100 → `Batch too large (101 messages, limit 100). Nothing was moved.`
+  (real n; state reset, forwards stay). The limit is enforced **during
+  accumulation**: the 101st forward is rejected immediately, without
+  being added to the batch;
+- an exception while sending the header, editing, or placing →
+  `Move failed: {Type}. Check the target chat manually.`
+  (type name, not `str()`); **no cleanup**, state reset,
+  retry = forward the batch again;
+- deleting the original forwards after assembly is **best-effort**: a
+  `delete_message` failure on one of them does not produce
+  `Move failed` (the thread is already built); the flow proceeds to
+  cleanup and to success;
+- a failure in step 5 → the final reply is still `Thread created…`
+  with honest `{x} of {y}` (the thread is already built);
+- `from_user is None` → not an admin (no crashes);
+- one pending per chat; conflicting origins in a batch → ask
+  "where from?" (one pair per batch).
+
+## 5. What returns / is removed from v2
+
+| Returns | Removed |
+|---|---|
+| Source-chat buffer — ONLY as the search base for originals in step 5 (records: message_id, date, text/caption, file_unique_id, sender id; matching: date + sender [when visible on both sides] + text, else caption, else file_unique_id) | Trigger buffer, `/thread`-on-anchor, window/anchor logic |
+| Question state router ("where from?" → "title?") | Steps 8–9 (reply tracking, thread-chat auto-cleanup) |
+| | `/target`, DM intake, redirect notices |
+
+## 6. v1 scope
+
+**In scope:** pair config, question state machine (with `/cancel`),
+thread assembly (incl. **sendMediaGroup albums**, user decision),
+cleanup with a partial report, all guards (limits, escaping, admin
+checks), templates and URL builders.
+
+**Out of scope:** AI, FastAPI/web, settings menu (TL side), persistence
+(restart = pending lost, source buffer empty → `Deleted 0 of Y`),
+rate-limit / cooldown (backlog), rollback of a partial assembly
+(backlog).
+
+## 7. Technical requirements and TL notes
+
+1. **Forward-as-reply is impossible** (`forwardMessage` has no
+   `reply_to_message_id`; `message_thread_id` — forum topics only).
+   The thread is built via `copyMessage` / `sendMediaGroup` — the
+   "Forwarded from" attribution is lost. Deviation from the wiki
+   ("forwards") — the thread takes priority.
+2. **Bot API history is unavailable** — "I go in and find by
+   timestamp+text" works only against live-seen messages (+ channel
+   ids). Key clarification for TL.
+3. `initialMessageUrl` and the redirect notice were removed from the v2
+   templates (the original "main" message is not visible inside a
+   forward) — deviation from the wiki.
+4. `sendMediaGroup` supports `reply_parameters` (Bot API 7+); the copy
+   fallback guarantees delivery even on errors.
+5. Albums: gluing via `sendMediaGroup` — **accepted for v1**
+   (instead of item-by-item copies).
+6. The wiki "Bot commands" section is outdated: the only command left
+   is `/cancel` (the trigger is not a command but the forward itself).
+7. Project language is English: all literals, bot replies — EN.
+8. **Pair invariant:** pairs are configured only for chats with
+   **shared administration** — a thread-chat admin drives cleanup in the
+   source chat (the bot's rights in the pair constrain but do not
+   replace that).
+9. Options to discuss with TL: (a) answer correlation — accept
+   "where from?"/"title?" only as replies to the bot's question (today
+   any admin text in a pending chat may become the title);
+   (b) late sessions — TTL (currently they live until `/cancel`);
+   (c) known fallback risk: a `sendMediaGroup` timeout after the actual
+   send → duplicated elements in the copy fallback.
+
+## 8. Repo state
+
+314 tests green, ruff clean (`--no-cache`). Iterations C+D (RED/GREEN
+for brief v3) and the security fixes are closed; the v3 bot code has
+been verified live (local stand: `chats.json`).
