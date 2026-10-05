@@ -1,0 +1,8 @@
+{
+  "pairs": [
+    {
+      "source": "@your_source_chat",
+      "target": "-1000000000000"
+    }
+  ]
+}
