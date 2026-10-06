@@ -1,36 +1,29 @@
 """Source→target pair registry tests: module ``bot.chats`` (BRIEF v3, §2).
 
-The v3 registry keeps the JSON pair format of v2 and adds the three
-lookups the watcher flow needs: the admin's «which chat did you forward
-from?» answer (``pair_for_source_ref``), the filters for the watcher
-(``is_configured_target``) and the buffering router (``is_source``),
-plus the forward-origin matching of step 2 (``pair_for_origin``).
+Cycle A moved the registry from the JSON file into the ``pairs``
+table: the module keeps its pairs IN MEMORY as a cache, the database
+is the source of truth (``refresh()`` reloads the cache, ``add_pair``
+/ ``remove_pair`` maintain it), and the JSON file is NOT read anymore.
+The synchronous read API stays exactly as it was — the watcher and the
+buffering router ask it without awaiting:
 
-Specification (BRIEF.md v3, sections «Конфиг», «Шаг 2», «Шаг 5»):
-- the config holds pairs ``source → target`` in a JSON file of the
-  shape::
-
-      {"pairs": [{"source": "@src", "target": "@tgt"},
-                 {"source": -100111, "target": -100222}]}
-
-  — public ``@usernames`` and private integer chat ids both allowed;
+Specification (BRIEF.md v3, sections "Config", "Step 2", "Step 5"):
+- the registry holds pairs ``source → target`` — public
+  ``@usernames`` and private integer chat ids both allowed (the
+  ``pairs`` table stores them as TEXT and reads them back in their
+  canonical Python form: numeric refs come back as ``int``);
 - ``target_for(source)`` returns the configured target for the source
   chat, or ``None`` when the source is not configured; matching works
   both by integer id and by ``@username``;
-- a missing, broken or malformed config file is NOT an error: the
-  registry behaves as an empty one — every lookup returns ``None`` and
-  nothing raises (fixed here by these tests);
-- a self-referential pair ``source == target`` is dropped at load:
-  such an entry is neither a usable source nor a watchable target
-  (security review M4), while complete pairs next to it keep working;
-  the drop must recognise the SAME chat in different forms too (int id
-  vs its numeric string, username letter-case — F4), a raw value
-  comparison is not enough;
+- a self-referential pair ``source == target`` can never ENTER the
+  registry: ``add_pair`` refuses it at insert (the same form-independent
+  drop as the old load time — security review M4 + F4), while complete
+  pairs beside it keep working;
 - ``pair_for_source_ref(text)`` parses the admin's answer to the
-  «which chat did you forward from?» question — a ``@username`` or a
+  «Which chat did you forward from?» question — a ``@username`` or a
   numeric id string (including ``-100…``) — and returns the matching
-  pair or ``None``: this is the config check of BRIEF step 2 («не
-  настроено → СТОП»);
+  pair or ``None``: this is the config check of BRIEF step 2 («not
+  configured → STOP»);
 - ``is_configured_target(chat_ref)`` reports whether the chat is the
   target of ANY pair (the watcher forward filter);
 - ``is_source(chat_ref)`` reports whether the chat is the source of ANY
@@ -40,21 +33,18 @@ Specification (BRIEF.md v3, sections «Конфиг», «Шаг 2», «Шаг 5�
   them matching a pair's source identifies the pair (step 2: an origin
   whose chat is configured lets the bot skip the question); an origin
   without a chat (a user forward) is ``None``;
-- the module exposes a singleton whose default path is ``chats.json``
-  in the current working directory;
-- every lookup reads the file anew, so a config written after startup
-  is picked up (no stale cache);
-- every test works on its own tmp files and never touches a project
-  config.
+- the module exposes a singleton (``bot.chats.chats``) whose pairs
+  live in the database — a pair added after startup is picked up by
+  ``add_pair`` (which refreshes), and the suite reseeds it per test;
+- every test seeds through ``add_pair`` (no file anywhere) and never
+  touches a project config.
 
-RED phase (security review F4): ``TestSelfPairRecognisedAcrossForms``
-pins the normalized self-pair drop (raw ``source != target`` misses the
-same chat written in two forms) — its tests fail until the load-time
-comparison normalises; the kept v2/v3 tests stay green.
+RED phase: ``add_pair`` / ``refresh`` do not exist yet — every seeded
+test fails inside its fixture or body (``AttributeError``), never at
+collection time: the ``bot.chats`` import stays lazy in the
+``chats_mod()`` helper below. The two tests that need no seeding (an
+empty registry, the singleton type) stay green.
 """
-
-import json
-from pathlib import Path
 
 import pytest
 
@@ -78,114 +68,53 @@ def chats_mod():
     return chats_module
 
 
-def write_pairs(path: Path, pairs) -> Path:
-    """Write a registry file of the documented JSON shape to ``path``."""
-    path.write_text(json.dumps({"pairs": pairs}), encoding="utf-8")
-    return path
+async def seed_pairs(pairs, registry=None) -> None:
+    """Insert ``pairs`` into the database-backed registry (the only seeding).
+
+    Every test starts from an empty table (the suite-wide
+    ``fresh_database`` fixture of ``tests/conftest.py`` reloads the
+    pair cache too), so seeding is a plain insert through
+    ``add_pair`` — which refreshes the cache on success.
+    """
+    target = chats_mod().chats if registry is None else registry
+    for pair in pairs:
+        added = await target.add_pair(pair["source"], pair["target"])
+        assert added is True, f"seeding the pair {pair!r} must be accepted, got {added!r}"
 
 
-def registry(tmp_path: Path, pairs=PAIRS):
-    """A registry on its own tmp file (never the project config)."""
-    return chats_mod().ChatPairs(write_pairs(tmp_path / "chats.json", pairs))
+@pytest.fixture()
+async def seeded_registry(fresh_database):
+    """The singleton registry seeded with ``PAIRS`` (fresh database + cache)."""
+    await seed_pairs(PAIRS)
+
+    return chats_mod().chats
 
 
 class TestTargetFor:
     """``target_for(source)``: lookup by @username and by integer id."""
 
-    def test_username_source_matches_username_pair(self, tmp_path: Path):
+    def test_username_source_matches_username_pair(self, seeded_registry):
         """``@src`` is configured → its target comes back verbatim (as a string)."""
-        pairs = registry(tmp_path)
+        assert seeded_registry.target_for("@src") == "@tgt"
 
-        assert pairs.target_for("@src") == "@tgt"
-
-    def test_integer_source_matches_integer_pair(self, tmp_path: Path):
+    def test_integer_source_matches_integer_pair(self, seeded_registry):
         """A private chat id is configured → its target comes back verbatim (as an int)."""
-        pairs = registry(tmp_path)
-
-        assert pairs.target_for(-100111) == -100222
+        assert seeded_registry.target_for(-100111) == -100222
 
     @pytest.mark.parametrize(
         "unknown_source",
         [pytest.param("@unknown", id="unknown-username"), pytest.param(-100999, id="unknown-id")],
     )
-    def test_unconfigured_source_returns_none(self, tmp_path: Path, unknown_source):
+    def test_unconfigured_source_returns_none(self, seeded_registry, unknown_source):
         """A chat without a pair → ``None``: the caller learns it is not a source chat."""
-        pairs = registry(tmp_path)
+        assert seeded_registry.target_for(unknown_source) is None
 
-        assert pairs.target_for(unknown_source) is None
-
-    def test_empty_registry_returns_none(self, tmp_path: Path):
-        """An empty pair list is a valid config: every lookup misses."""
-        pairs = registry(tmp_path, [])
+    def test_empty_registry_returns_none(self):
+        """An empty pair list is a valid registry: every lookup misses."""
+        pairs = chats_mod().chats
 
         assert pairs.target_for("@src") is None
         assert pairs.target_for(-100111) is None
-
-
-class TestBrokenRegistryIsEmpty:
-    """Broken config → empty registry (``None``), never an exception."""
-
-    def test_missing_file_is_not_an_error(self, tmp_path: Path):
-        """No config file at all → lookups miss instead of crashing the bot."""
-        pairs = chats_mod().ChatPairs(tmp_path / "does-not-exist.json")
-
-        assert pairs.target_for("@src") is None
-
-    def test_invalid_json_is_not_an_error(self, tmp_path: Path):
-        """A hand-edited/truncated file → empty registry, no exception."""
-        path = tmp_path / "chats.json"
-        path.write_text("{oops, not json", encoding="utf-8")
-        pairs = chats_mod().ChatPairs(path)
-
-        assert pairs.target_for("@src") is None, (
-            "a syntactically broken config must read as \"no pairs\", not raise"
-        )
-
-    @pytest.mark.parametrize(
-        "content",
-        [
-            pytest.param("[1, 2, 3]", id="json-list-instead-of-object"),
-            pytest.param(json.dumps({"pairs": "nope"}), id="pairs-not-a-list"),
-            pytest.param(json.dumps({"nonsense": []}), id="pairs-key-missing"),
-            pytest.param(json.dumps({"pairs": [{"target": "@tgt"}]}), id="source-key-missing"),
-            pytest.param(json.dumps({"pairs": [{"source": "@src"}]}), id="target-key-missing"),
-        ],
-    )
-    def test_malformed_content_reads_as_empty(self, tmp_path: Path, content: str):
-        """Anything that is not a list of complete pairs → empty registry."""
-        path = tmp_path / "chats.json"
-        path.write_text(content, encoding="utf-8")
-        pairs = chats_mod().ChatPairs(path)
-
-        assert pairs.target_for("@src") is None
-
-    def test_malformed_entries_do_not_hide_the_valid_ones(self, tmp_path: Path):
-        """Garbage entries are skipped; a complete pair next to them still works."""
-        pairs = registry(
-            tmp_path,
-            [42, {"target": "@dangling"}, {"source": "@src"}, {"source": "@ok", "target": "@good"}],
-        )
-
-        assert pairs.target_for("@src") is None, "an entry without a target is not a pair"
-        assert pairs.target_for("@ok") == "@good", "a complete pair must survive bad neighbours"
-
-
-class TestLookupReadsTheConfigFresh:
-    """No stale cache: pairs written after construction are visible."""
-
-    def test_pairs_written_after_construction_are_seen(self, tmp_path: Path):
-        """The config may be created after the registry (even after bot startup)."""
-        path = tmp_path / "chats.json"
-        pairs = chats_mod().ChatPairs(path)
-
-        assert pairs.target_for("@src") is None, "sanity: no file yet"
-
-        write_pairs(path, PAIRS)
-
-        assert pairs.target_for("@src") == "@tgt", (
-            "target_for must read the config anew — a file written after startup "
-            "has to be picked up without restarting the process"
-        )
 
 
 class TestModuleSingleton:
@@ -198,22 +127,6 @@ class TestModuleSingleton:
         assert isinstance(mod.chats, mod.ChatPairs), (
             "bot.chats must expose the singleton chats = ChatPairs()"
         )
-
-    def test_default_path_is_chats_json_in_cwd(self, tmp_path: Path, monkeypatch):
-        """The singleton's default path is ``chats.json`` in the current directory."""
-        monkeypatch.chdir(tmp_path)
-        write_pairs(Path.cwd() / "chats.json", PAIRS)
-
-        assert chats_mod().chats.target_for("@src") == "@tgt", (
-            "the singleton must resolve chats.json against the current working directory"
-        )
-
-
-@pytest.fixture()
-def registry_in_cwd(tmp_path: Path, monkeypatch):
-    """Run the test against a cwd ``chats.json`` holding ``PAIRS``."""
-    monkeypatch.chdir(tmp_path)
-    write_pairs(Path.cwd() / "chats.json", PAIRS)
 
 
 class TestPairForSourceRef:
@@ -244,7 +157,7 @@ class TestPairForSourceRef:
             ),
         ],
     )
-    def test_configured_answers_resolve_to_the_pair(self, registry_in_cwd, answer, expected):
+    def test_configured_answers_resolve_to_the_pair(self, seeded_registry, answer, expected):
         """A configured ``@username``/id answer comes back as its pair dict."""
         mod = chats_mod()
 
@@ -263,20 +176,13 @@ class TestPairForSourceRef:
             pytest.param("12.5", id="not-an-integer"),
         ],
     )
-    def test_unconfigured_answers_resolve_to_none(self, registry_in_cwd, answer):
-        """Anything that is not a configured pair → ``None`` («не настроено → СТОП»)."""
+    def test_unconfigured_answers_resolve_to_none(self, seeded_registry, answer):
+        """Anything that is not a configured pair → ``None`` («not configured → STOP»)."""
         mod = chats_mod()
 
         assert mod.pair_for_source_ref(answer) is None, (
             f"the answer {answer!r} must not resolve to any pair"
         )
-
-    def test_broken_config_resolves_to_none(self, tmp_path: Path, monkeypatch):
-        """A broken registry answers every question with ``None``."""
-        monkeypatch.chdir(tmp_path)
-        Path.cwd().joinpath("chats.json").write_text("{oops", encoding="utf-8")
-
-        assert chats_mod().pair_for_source_ref("@src") is None
 
 
 class TestIsConfiguredTarget:
@@ -287,11 +193,11 @@ class TestIsConfiguredTarget:
     of any pair; source-only chats and strangers are refused.
     """
 
-    def test_username_target_is_configured(self, registry_in_cwd):
+    def test_username_target_is_configured(self, seeded_registry):
         """``@tgt`` is the target of a pair → the watcher admits it."""
         assert chats_mod().is_configured_target("@tgt") is True
 
-    def test_integer_target_is_configured(self, registry_in_cwd):
+    def test_integer_target_is_configured(self, seeded_registry):
         """A private id used as a target works exactly like a username."""
         assert chats_mod().is_configured_target(-100222) is True
 
@@ -304,16 +210,9 @@ class TestIsConfiguredTarget:
             pytest.param(-100999, id="stranger-id"),
         ],
     )
-    def test_non_targets_are_not_configured(self, registry_in_cwd, ref):
+    def test_non_targets_are_not_configured(self, seeded_registry, ref):
         """Source-only chats and strangers must not pass the watcher filter."""
         assert chats_mod().is_configured_target(ref) is False
-
-    def test_broken_config_configures_nothing(self, tmp_path: Path, monkeypatch):
-        """A broken registry must not let any chat through."""
-        monkeypatch.chdir(tmp_path)
-        Path.cwd().joinpath("chats.json").write_text("{oops", encoding="utf-8")
-
-        assert chats_mod().is_configured_target("@tgt") is False
 
 
 class TestIsSource:
@@ -324,11 +223,11 @@ class TestIsSource:
     never be recorded.
     """
 
-    def test_username_source_is_a_source(self, registry_in_cwd):
+    def test_username_source_is_a_source(self, seeded_registry):
         """``@src`` is the source of a pair → buffered."""
         assert chats_mod().is_source("@src") is True
 
-    def test_integer_source_is_a_source(self, registry_in_cwd):
+    def test_integer_source_is_a_source(self, seeded_registry):
         """A private id used as a source works exactly like a username."""
         assert chats_mod().is_source(-100111) is True
 
@@ -341,16 +240,9 @@ class TestIsSource:
             pytest.param(-100999, id="stranger-id"),
         ],
     )
-    def test_non_sources_are_not_sources(self, registry_in_cwd, ref):
+    def test_non_sources_are_not_sources(self, seeded_registry, ref):
         """Threaded-only chats and strangers must not be buffered."""
         assert chats_mod().is_source(ref) is False
-
-    def test_broken_config_has_no_sources(self, tmp_path: Path, monkeypatch):
-        """A broken registry must not make any chat a source."""
-        monkeypatch.chdir(tmp_path)
-        Path.cwd().joinpath("chats.json").write_text("{oops", encoding="utf-8")
-
-        assert chats_mod().is_source("@src") is False
 
 
 class TestPairForOrigin:
@@ -359,12 +251,13 @@ class TestPairForOrigin:
     A forward origin carries the origin chat as ``chat_id`` and/or
     ``username`` (channels show both, a public group shows a username,
     a private group only its id). ANY match against a pair's source
-    identifies the pair — «forward_origin содержит чат и пара настроена
-    → молча идём дальше». An origin without a chat (a user forward)
-    resolves to ``None`` — the bot asks the «which chat?» question.
+    identifies the pair («forward_origin carries a chat and a pair is
+    configured → proceed silently»). An origin without a chat (a user
+    forward) resolves to ``None`` — the bot asks the «which chat?»
+    question.
     """
 
-    def test_origin_matching_by_integer_id(self, registry_in_cwd):
+    def test_origin_matching_by_integer_id(self, seeded_registry):
         """A public origin (@name) of the group configured by ``-100…`` id → its pair.
 
         The pin of the spec: the pair is stored as the private id of
@@ -378,7 +271,7 @@ class TestPairForOrigin:
             "the origin chat id matches the pair keyed by that id"
         )
 
-    def test_origin_matching_by_username(self, registry_in_cwd):
+    def test_origin_matching_by_username(self, seeded_registry):
         """An origin with ``chat_id=None`` but a username → the username pair."""
         mod = chats_mod()
 
@@ -387,7 +280,7 @@ class TestPairForOrigin:
             "target": "@tgt",
         }
 
-    def test_origin_matching_by_username_with_id_absent(self, registry_in_cwd):
+    def test_origin_matching_by_username_with_id_absent(self, seeded_registry):
         """A partial origin (the ``chat_id`` key is missing entirely) still matches."""
         mod = chats_mod()
 
@@ -401,32 +294,33 @@ class TestPairForOrigin:
             pytest.param({}, id="empty-origin"),
         ],
     )
-    def test_origin_without_a_configured_chat_is_none(self, registry_in_cwd, origin):
+    def test_origin_without_a_configured_chat_is_none(self, seeded_registry, origin):
         """A foreign or chatless origin → ``None``: the bot must ask the question."""
         assert chats_mod().pair_for_origin(origin) is None
 
-    def test_pair_for_origin_reads_the_config_fresh(self, tmp_path: Path, monkeypatch):
-        """Pairs added after startup are matched too (no stale cache)."""
-        monkeypatch.chdir(tmp_path)
-        assert chats_mod().pair_for_origin({"username": "src"}) is None, "sanity: no file"
+    async def test_pair_for_origin_sees_pairs_added_after_startup(self):
+        """A pair added later is matched too — ``add_pair`` refreshes the cache."""
+        mod = chats_mod()
+        assert mod.pair_for_origin({"username": "src"}) is None, "sanity: empty registry"
 
-        write_pairs(Path.cwd() / "chats.json", PAIRS)
+        await seed_pairs(PAIRS)
 
-        assert chats_mod().pair_for_origin({"username": "src"}) == {
+        assert mod.pair_for_origin({"username": "src"}) == {
             "source": "@src",
             "target": "@tgt",
         }
 
 
 class TestSelfReferentialPairIsDropped:
-    """A pair whose source equals its target never loads (security review M4).
+    """A pair whose source equals its target never enters the registry (M4).
 
     ``{"source": "@x", "target": "@x"}`` would make a chat its own
     target: the bot would try to build a thread inside the very chat it
     moves messages out of, and the filters would watch it on both ends.
-    Such an entry is dropped at load: ``target_for`` misses for it, and
-    neither ``is_configured_target`` nor ``is_source`` reports it, while
-    every complete pair next to it keeps working.
+    ``add_pair`` refuses such a pair at INSERT (cycle A: there is no
+    file load anymore), so ``target_for`` misses for it and neither
+    ``is_configured_target`` nor ``is_source`` reports it, while every
+    complete pair beside it keeps working.
     """
 
     @pytest.mark.parametrize(
@@ -436,16 +330,15 @@ class TestSelfReferentialPairIsDropped:
             pytest.param(-100111, id="integer-loop"),
         ],
     )
-    def test_self_pair_is_dropped_for_every_lookup(self, tmp_path: Path, monkeypatch, ref):
-        """source == target → not a target, not a source, no resolvable target."""
-        monkeypatch.chdir(tmp_path)
-        write_pairs(Path.cwd() / "chats.json", [{"source": ref, "target": ref}])
+    async def test_self_pair_is_dropped_for_every_lookup(self, ref):
+        """source == target → refused, not a target, not a source, no target."""
         mod = chats_mod()
 
-        assert mod.chats.target_for(ref) is None, (
-            f"a self-referential pair must not resolve as {ref!r} — it would "
+        assert await mod.chats.add_pair(ref, ref) is False, (
+            f"a self-referential pair must not be accepted as {ref!r} — it would "
             "let the source chat move messages into itself"
         )
+        assert mod.chats.target_for(ref) is None, "a refused self-pair must not resolve"
         assert mod.is_configured_target(ref) is False, (
             "a self-referential pair must not make the watcher watch the source chat"
         )
@@ -453,23 +346,16 @@ class TestSelfReferentialPairIsDropped:
             "a self-referential pair must not make the buffering watch the target chat"
         )
 
-    def test_dropped_self_pair_does_not_hide_the_valid_ones(
-        self, tmp_path: Path, monkeypatch
-    ):
-        """Garbage is skipped selectively: a complete pair beside it still works."""
-        monkeypatch.chdir(tmp_path)
-        write_pairs(
-            Path.cwd() / "chats.json",
-            [
-                {"source": "@loop", "target": "@loop"},
-                {"source": "@ok", "target": "@good"},
-            ],
-        )
+    async def test_dropped_self_pair_does_not_hide_the_valid_ones(self):
+        """Refusal is selective: a complete pair beside the refused one still works."""
         mod = chats_mod()
+
+        assert await mod.chats.add_pair("@loop", "@loop") is False, "the self-pair is refused"
+        assert await mod.chats.add_pair("@ok", "@good") is True, "the valid pair is accepted"
 
         assert mod.chats.target_for("@loop") is None, "the self-pair must be dropped"
         assert mod.chats.target_for("@ok") == "@good", (
-            "a complete pair must survive the dropped self-referential neighbour"
+            "a complete pair must survive the refused self-referential neighbour"
         )
         assert mod.is_configured_target("@good") is True
         assert mod.is_configured_target("@loop") is False
@@ -478,14 +364,15 @@ class TestSelfReferentialPairIsDropped:
 
 
 class TestSelfPairRecognisedAcrossForms:
-    """The self-pair drop must not compare RAW values (security review F4).
+    """The self-pair refusal must not compare RAW values (security review F4).
 
     ``{"source": -100111, "target": "-100111"}`` (int id vs its numeric
     string) and ``{"source": "@MyChat", "target": "@mychat"}`` (Telegram
     usernames are case-insensitive) are the SAME chat in two forms — a
-    raw ``source != target`` keeps such a pair and makes a chat its own
-    target. Every lookup must refuse it exactly like the canonical
-    ``source == target`` pair of ``TestSelfReferentialPairIsDropped``.
+    raw ``source != target`` would accept such a pair and make a chat
+    its own target. ``add_pair`` must refuse it exactly like the
+    canonical ``source == target`` pair of
+    ``TestSelfReferentialPairIsDropped``.
     """
 
     @pytest.mark.parametrize(
@@ -505,17 +392,16 @@ class TestSelfPairRecognisedAcrossForms:
             ),
         ],
     )
-    def test_a_self_pair_in_another_form_is_dropped(
-        self, tmp_path: Path, monkeypatch, pair, own_ref, other_ref
-    ):
-        """The pair loads as no pair at all: no target, not a source, not a target."""
-        monkeypatch.chdir(tmp_path)
-        write_pairs(Path.cwd() / "chats.json", [pair])
+    async def test_a_self_pair_in_another_form_is_dropped(self, pair, own_ref, other_ref):
+        """The pair never enters the registry: no target, not a source, not a target."""
         mod = chats_mod()
 
-        assert mod.chats.target_for(own_ref) is None, (
-            f"the self-referential pair {pair!r} must not resolve as {own_ref!r} — "
+        assert await mod.chats.add_pair(pair["source"], pair["target"]) is False, (
+            f"the self-referential pair {pair!r} must be refused — "
             "it would let the chat move messages into itself"
+        )
+        assert mod.chats.target_for(own_ref) is None, (
+            f"the self-referential pair {pair!r} must not resolve as {own_ref!r}"
         )
         assert mod.is_source(own_ref) is False, (
             "a self-pair must not make the buffering watch the target chat"

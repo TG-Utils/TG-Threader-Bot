@@ -15,13 +15,24 @@ the buffer is live observation of the source chat (see §5).
 
 ## 2. Configuration
 
-- **"source → thread" pairs live only in the config** (`chats.json`,
-  pair format as before: `{"pairs": [{"source": …, "target": …}]}`).
-  No dynamic memory: the TL side will later attach a **settings menu**
-  to the pairs (the bot is public; the config must stay machine-readable).
+- **"source → thread" pairs live in the `pairs` database table**
+  (PostgreSQL via `DATABASE_URL`, schema through Alembic migrations).
+  `chats.json` is no longer read. Pairs are managed with the
+  **`/settings` menu** in the bot's DM (open to `OWNER_ID` and to
+  admins of any pair's chats): the list shows chat titles from
+  `getChat`, a pair is added by forwarding a message from the chat or
+  by typing `@username`/id (with self-pair, bot-rights and duplicate
+  checks → inline confirmation) and removed with an inline button.
+  Both add-flow prompts also carry a **chat picker**: buttons of every
+  chat already known from the pairs (titles from `getChat`,
+  `st:pick:<ref>`) plus `Cancel` (`st:cancel`).
+- **Bot UI messages come from JSON language packs**
+  (`bot/locales/*.json`, selected by `LOCALE`) — a custom pack can
+  replace every literal without touching the code.
 - **The bot is an admin in BOTH chats of a pair**, with
   `can_delete_messages` in both (mandatory in the source chat: it deletes
-  other people's messages).
+  other people's messages). The menu verifies this at pair-creation
+  time.
 - The bot operates **only** in configured thread chats; all other chats
   are ignored completely.
 
@@ -44,6 +55,13 @@ admin) accumulates the sequence of forwards into a **pending state**
 
 The question (as a reply to the first message of the batch):
 `Which chat did you forward from? Reply with @username or its id.`
+
+The question message also carries an **inline picker**: one button per
+configured source whose pair targets the current chat (labels are chat
+titles from `getChat`, `callback_data="w:src:<ref>"`) plus a `Cancel`
+button (`w:cancel` = `/cancel`). A tap runs exactly the typed-answer
+path (config check, terminal `not_configured`, stage advance); the
+typed answer keeps working as before.
 
 The admin's answer is checked against the config:
 
@@ -143,10 +161,11 @@ thread assembly (incl. **sendMediaGroup albums**, user decision),
 cleanup with a partial report, all guards (limits, escaping, admin
 checks), templates and URL builders.
 
-**Out of scope:** AI, FastAPI/web, settings menu (TL side), persistence
-(restart = pending lost, source buffer empty → `Deleted 0 of Y`),
-rate-limit / cooldown (backlog), rollback of a partial assembly
-(backlog).
+**Out of scope:** AI, FastAPI/web, persistence of *pending sessions*
+(restart = pending lost; the source buffer now persists in the
+database), rate-limit / cooldown (backlog), rollback of a partial
+assembly (backlog). The settings menu is no longer "TL side" — it is
+implemented in this repo (see §2).
 
 ## 7. Technical requirements and TL notes
 
@@ -165,8 +184,9 @@ rate-limit / cooldown (backlog), rollback of a partial assembly
    fallback guarantees delivery even on errors.
 5. Albums: gluing via `sendMediaGroup` — **accepted for v1**
    (instead of item-by-item copies).
-6. The wiki "Bot commands" section is outdated: the only command left
-   is `/cancel` (the trigger is not a command but the forward itself).
+6. The wiki "Bot commands" section is outdated: the commands are
+   `/cancel` and `/settings` (the thread trigger is not a command but
+   the forward itself).
 7. Project language is English: all literals, bot replies — EN.
 8. **Pair invariant:** pairs are configured only for chats with
    **shared administration** — a thread-chat admin drives cleanup in the
@@ -178,9 +198,42 @@ rate-limit / cooldown (backlog), rollback of a partial assembly
    (b) late sessions — TTL (currently they live until `/cancel`);
    (c) known fallback risk: a `sendMediaGroup` timeout after the actual
    send → duplicated elements in the copy fallback.
+10. **Second security review** (after DB/menu/pickers — all closed in
+    code; verified by a follow-up re-review): pair authority checked at
+    confirm time (caller must admin BOTH chats — item 8 now enforced;
+    owner is exempt from BOTH the caller and the bot-rights rechecks,
+    by design for bootstrap) with a 3 s verdict cache
+    (`FRESH_TTL`) against confirm-spam, TTL + negative caches for admin
+    lookups and `getChat` titles (`bot/admin_cache.py`, fail-closed,
+    protects the API budget), pair-registry write lock, `st:*`
+    private-only, safe edits, DSN hygiene in every raised chain,
+    64-byte callback-data guard, `/settings` resets the step, `LOCALE`
+    and `LOG_LEVEL` validation (INFO/DEBUG actually logged via
+    `_configure_logging`), the >4300-digit answer guard, the ≤200-char
+    `pair_added` alert, and CI hardening (`permissions: contents: read`
+    + `timeout-minutes`; SHA-pinning/lockfile remain backlog).
+    Still open (backlog/TL): buffer message retention policy
+    (privacy), form-independent pair dedupe (`@Name` ≡ id ≡ `@name`),
+    `SecretStr` for the token, menu scoping (only pairs relevant to
+    the caller), the per-batch registry refresh in the source picker,
+    an `st:del` recheck window for rows unknown to the cache, and
+    admin-cache eviction/bot-keying — plus 9(a)/9(b), UTF-16-aware
+    alert truncation (a 200-codepoint alert with heavy emoji may still
+    exceed Telegram's UTF-16 limit — swallowed, never crashes),
+    wrapping the remaining `callback.answer` calls against
+    `TelegramBadRequest`, fresh-exception re-raise in the admin cache
+    (a cached exception accumulates tracebacks per hit), and buffer
+    write flood-protection (per-message INSERT+DELETE under spam).
 
 ## 8. Repo state
 
-314 tests green, ruff clean (`--no-cache`). Iterations C+D (RED/GREEN
-for brief v3) and the security fixes are closed; the v3 bot code has
-been verified live (local stand: `chats.json`).
+511 tests green, ruff clean (`--no-cache`). Iterations C+D (RED/GREEN
+for brief v3), the security fixes and the post-v1 backlog items are
+closed: async database layer (SQLAlchemy + Alembic: `buffer_messages`,
+`pairs` — the source buffer survives restarts), the `/settings` menu
+(ACL, add/delete flows, `getChat` titles), JSON language packs
+(`LOCALE`), GitHub Actions CI (ruff + pytest, Python 3.10/3.14) and the
+inline chat pickers (source question + add-flow prompts), hardened by a
+second security review (§7.10).
+The v3 flow has been verified live; migrations were applied to a real
+PostgreSQL 14.

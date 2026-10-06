@@ -1,1 +1,1 @@
-"""Message handlers package: the watcher and the buffering routers."""
+"""Message handlers package: the settings, watcher and buffering routers."""
