@@ -305,8 +305,10 @@ class TestConcurrentRegistryWrites:
         removal = asyncio.create_task(reg.remove_pair(row.id))
         try:
             await asyncio.wait_for(asyncio.shield(removal), 2)
-        except TimeoutError:
+        except asyncio.TimeoutError:
             # The fix serializes the writers: the removal waits for the refresh.
+            # asyncio.TimeoutError (not the builtin): until 3.11 wait_for raises
+            # a class of its own — on 3.10 they are different exceptions.
             pass
         gate.set()
         await asyncio.wait_for(asyncio.gather(slow_refresh, removal), 5)
