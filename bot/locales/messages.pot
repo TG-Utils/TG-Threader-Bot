@@ -1,0 +1,161 @@
+# Translations template for PROJECT.
+# Copyright (C) 2026 ORGANIZATION
+# This file is distributed under the same license as the PROJECT project.
+# FIRST AUTHOR <EMAIL@ADDRESS>, 2026.
+#
+#, fuzzy
+msgid ""
+msgstr ""
+"Project-Id-Version: PROJECT VERSION\n"
+"Report-Msgid-Bugs-To: EMAIL@ADDRESS\n"
+"POT-Creation-Date: 2026-10-09 01:33+0300\n"
+"PO-Revision-Date: YEAR-MO-DA HO:MI+ZONE\n"
+"Last-Translator: FULL NAME <EMAIL@ADDRESS>\n"
+"Language-Team: LANGUAGE <LL@li.org>\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Generated-By: Babel 2.18.0\n"
+
+#: bot/handlers/settings.py:338 bot/keyboards.py:120
+msgid "Cancel"
+msgstr ""
+
+#: bot/handlers/settings.py:326
+msgid "Add pair"
+msgstr ""
+
+#: bot/handlers/settings.py:329
+msgid "Delete pair"
+msgstr ""
+
+#: bot/handlers/settings.py:337
+msgid "Confirm"
+msgstr ""
+
+#: bot/handlers/settings.py:346
+#, python-brace-format
+msgid "Pair settings ({n}):"
+msgstr ""
+
+#: bot/handlers/settings.py:353 bot/handlers/settings.py:583
+#: bot/handlers/settings.py:632
+msgid "No pairs configured yet."
+msgstr ""
+
+#: bot/handlers/settings.py:425 bot/handlers/settings.py:486
+#: bot/handlers/settings.py:627
+msgid "You are not allowed to manage settings."
+msgstr ""
+
+#: bot/handlers/settings.py:495 bot/handlers/settings.py:715
+#: bot/handlers/settings.py:756 bot/handlers/watcher.py:679
+#: bot/handlers/watcher.py:797
+msgid "Cancelled."
+msgstr ""
+
+#: bot/handlers/settings.py:519 bot/handlers/settings.py:533
+msgid "Not a chat reference. Send a forwarded message, @username or numeric id."
+msgstr ""
+
+#: bot/handlers/settings.py:526
+msgid ""
+"Now do the same for the target chat: forward a message or send @username "
+"or id."
+msgstr ""
+
+#: bot/handlers/settings.py:537
+msgid "Source and target are the same chat."
+msgstr ""
+
+#: bot/handlers/settings.py:541
+msgid ""
+"I must be an admin with the Delete Messages permission in both chats of a"
+" pair."
+msgstr ""
+
+#: bot/handlers/settings.py:549
+#, python-brace-format
+msgid "Add pair: {source} → {target}?"
+msgstr ""
+
+#: bot/handlers/settings.py:569
+msgid "Send a message forwarded from the source chat, or its @username or id."
+msgstr ""
+
+#: bot/handlers/settings.py:597
+msgid "Back"
+msgstr ""
+
+#: bot/handlers/settings.py:600
+msgid "Select a pair to remove:"
+msgstr ""
+
+#: bot/handlers/settings.py:632
+msgid "Pair removed."
+msgstr ""
+
+#: bot/handlers/settings.py:685
+msgid "This pair already exists."
+msgstr ""
+
+#: bot/handlers/settings.py:692
+#, python-brace-format
+msgid "Pair added: {source} → {target}."
+msgstr ""
+
+#: bot/handlers/watcher.py:494 bot/handlers/watcher.py:611
+#, python-brace-format
+msgid "Batch too large ({n} messages, limit 100). Nothing was moved."
+msgstr ""
+
+#: bot/handlers/watcher.py:504
+#, python-brace-format
+msgid "Invalid target chat in configuration: {target}. Nothing was moved."
+msgstr ""
+
+#: bot/handlers/watcher.py:518 bot/handlers/watcher.py:688
+#: bot/handlers/watcher.py:770
+msgid "This chat is not configured as a source chat."
+msgstr ""
+
+#: bot/handlers/watcher.py:530
+#, python-brace-format
+msgid "Topic: <b>{title}</b>"
+msgstr ""
+
+#: bot/handlers/watcher.py:534
+#, python-brace-format
+msgid ""
+"Please use <a href=\"{thread_url}\">this link</a> to respond to this "
+"thread."
+msgstr ""
+
+#: bot/handlers/watcher.py:548
+#, python-brace-format
+msgid "Move failed: {error}. Check the target chat manually."
+msgstr ""
+
+#: bot/handlers/watcher.py:567
+#, python-brace-format
+msgid "Thread created: {n} message(s). {thread_url}"
+msgstr ""
+
+#: bot/handlers/watcher.py:570
+#, python-brace-format
+msgid "Deleted {x} of {y} original messages."
+msgstr ""
+
+#: bot/handlers/watcher.py:628 bot/handlers/watcher.py:653
+msgid "Which chat did you forward from? Reply with @username or its id."
+msgstr ""
+
+#: bot/handlers/watcher.py:642 bot/handlers/watcher.py:693
+#: bot/handlers/watcher.py:775
+msgid "Thread title? Send the title as a plain message."
+msgstr ""
+
+#: bot/handlers/watcher.py:700
+msgid "Title is empty — send the thread title."
+msgstr ""
+

@@ -80,7 +80,7 @@ Specification (BRIEF.md v3, steps 1–5 and «Отказы и лимиты»):
      pair of another chat never qualifies) → ``delete_message(source,
      origin.message_id)`` WITHOUT consulting the buffer; any other
      origin (an unconfigured one, a foreign configured pair) →
-     ``buffer.find_and_take(source, origin.date, text, caption,
+     ``await buffer.find_and_take(source, origin.date, text, caption,
      file_unique_id, sender_id)`` — the sender taken from the forward
      origin (``sender_user.id`` / ``sender_chat.id``, unknown →
      ``None``) — and delete the found id, or skip; a raising
@@ -120,26 +120,62 @@ never breaking the sort — instead of walking the refs in arrival order.
 Pinned by ``TestPlacementFollowsOriginDate`` (chain order, equal-date
 stability, missing dates) and ``TestAlbumGluedAfterChronologicalSort``
 (an interleaved album survives the sort as ONE ``send_media_group``).
+
+Inline source picker (the requested inline buttons that choose a chat
+by its TITLE): the «Which chat did you forward from?» question — BOTH
+call sites in ``on_forward`` — arrives with an inline keyboard: one
+button per registry source whose pair targets the CURRENT chat (the
+same ``pair_targets_chat`` filter, registry order, duplicates by
+canonical ref dropped at their FIRST occurrence), the label resolved
+through ``bot.get_chat`` (``.title`` → ``.username`` rendered as
+``@name`` → the ref itself, a RAISING ``get_chat`` reading as the ref
+too), ``callback_data = "w:src:" + str(ref)`` (an int id or an
+``@username``), and a trailing ``Cancel`` button
+(``settings.cancel_button``, the literal ``Cancel``) with
+``callback_data="w:cancel"``. The title question stays a plain prompt,
+and a registry that names no source of this chat asks WITHOUT a
+keyboard (the status quo — that test is GREEN in RED). The router
+additionally registers callback handlers (dispatched by
+``dispatch_callback`` below, mirroring ``tests/test_settings.py``):
+
+- ``w:src:<ref>`` at ``asking_source`` with a live session re-runs
+  exactly the text-answer path: an admin gate on
+  ``callback.message.chat`` (a ``from_user`` of ``None`` or a
+  non-admin changes NOTHING), then ``pair_for_source_ref`` +
+  ``pair_targets_chat`` — a hit fixes the pair, moves to
+  ``asking_title`` and asks the title question (announced by the next
+  question, never by an extra answer); a miss runs the TERMINAL
+  refusal ``not_configured`` (prompts deleted, session reset). During
+  ``asking_title`` — and without a session — the click is ignored: a
+  TEXT there would become the title, a button must not;
+- ``w:cancel`` mirrors ``/cancel``: prompts deleted, exactly
+  ``Cancelled.``, session reset (any stage, admin only), ignored
+  without a session;
+- every consumed ``w:*`` branch ends in an EMPTY
+  ``callback.answer()`` (the spinner pin, no alert text).
+
+Pinned by ``TestSourceQuestionKeyboard``, ``TestSourcePickerCallback``
+and ``TestCancelCallback``.
 """
 
 import asyncio
 import html
 import inspect
-import json
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from aiogram import Router
+from aiogram.exceptions import TelegramBadRequest
+from sqlalchemy import select
 
 # --- chats of the fixtures -------------------------------------------------
 
 #: The threaded (target) chat the forwards arrive in.
 TARGET_CHAT_ID = -100666
 TARGET_USERNAME = "forumgroup"
-#: The registry key of that target chat (``chats.json`` per test cwd).
+#: The registry key of that target chat (a pair seeded by the fixture).
 TARGET_REF = f"@{TARGET_USERNAME}"
 
 #: A second configured threaded chat (the session-isolation tests).
@@ -248,26 +284,42 @@ def sessions_mod():
     return sessions_module
 
 
-def write_chats_config(pairs) -> Path:
-    """Write the pair registry the way ``bot.chats`` reads it."""
-    path = Path.cwd() / "chats.json"
-    path.write_text(json.dumps({"pairs": pairs}), encoding="utf-8")
-    return path
+async def set_pairs(pairs) -> None:
+    """Replace the pair registry with ``pairs`` (the database is the source of truth).
+
+    Cycle A: the pairs live in the ``pairs`` table, so a registry
+    rewrite is a DELETE of whatever rows stand there followed by
+    ``add_pair`` inserts (each of them refreshes the cache). ``Pair``
+    is imported lazily so a missing model fails inside the seeding,
+    never at collection.
+    """
+    import bot.chats as chats_module
+    from bot.database import session
+    from bot.models import Pair
+
+    async with session() as db:
+        for row in (await db.execute(select(Pair))).scalars():
+            await db.delete(row)
+    for pair in pairs:
+        added = await chats_module.chats.add_pair(pair["source"], pair["target"])
+        assert added is True, f"seeding the pair {pair!r} must be accepted, got {added!r}"
 
 
 @pytest.fixture(autouse=True)
-def configured_cwd(tmp_path, monkeypatch):
-    """Run every test in a tmp cwd whose ``chats.json`` holds ``PAIRS``.
+async def configured_cwd(tmp_path, monkeypatch, fresh_database):
+    """Run every test in a tmp cwd with the ``PAIRS`` registry seeded.
 
-    The shared singletons (pending sessions, source buffer) are reset
-    too: they persist across tests by design — the handlers use them.
-    Pure file/import operations on purpose: while ``bot.sessions`` /
-    ``bot.handlers.watcher`` do not exist (RED), this fixture must not
-    swallow the failure — the tests then fail with
-    ``ModuleNotFoundError`` on their own first helper call.
+    Cycle A: the registry is database-backed — seeding is the async
+    ``set_pairs`` (DELETE + ``add_pair``, which refreshes the cache);
+    the cwd only keeps the test isolated from the repository files.
+    The shared pending-session store is reset too: it persists across
+    tests by design — the handlers use it. The DATABASE buffer needs
+    no reset here: the suite-wide ``fresh_database`` fixture of
+    ``tests/conftest.py`` hands every test a fresh in-memory database
+    (and reloads the pair cache for it).
     """
     monkeypatch.chdir(tmp_path)
-    write_chats_config(PAIRS)
+    await set_pairs(PAIRS)
     try:
         import bot.sessions as sessions_module
     except ModuleNotFoundError:
@@ -275,16 +327,34 @@ def configured_cwd(tmp_path, monkeypatch):
     if sessions_module is not None:
         for chat_id in (TARGET_CHAT_ID, OTHER_TARGET_ID):
             sessions_module.sessions.reset(chat_id)
-    import bot.buffer as buffer_module
-
-    buffer_module.buffer._chats.clear()
 
 
 # --- helpers: bot api mocks ------------------------------------------------
-def make_bot(status="administrator"):
-    """A message bot mock with the admin gate pre-configured."""
+def make_bot(status="administrator", *, chats=None):
+    """A message bot mock with the admin gate pre-configured.
+
+    ``get_chat`` (the label source of the inline-keyboard buttons)
+    answers from the optional ``chats`` map — ``{str(ref): chat object
+    | Exception}`` — and RAISES for anything else: a chat the map does
+    not know must fall back to the ref itself, and an auto-created
+    mock attribute would never pass aiogram's string validation anyway.
+    An ``Exception`` value is raised as-is (the explicit error case of
+    the label fallback chain).
+    """
     bot = AsyncMock(name="bot")
     bot.get_chat_member.return_value = SimpleNamespace(status=status)
+    bot.known_chats = dict(chats or {})
+
+    def _get_chat(*args, **kwargs):
+        ref = args[0] if args else kwargs.get("chat_id")
+        value = bot.known_chats.get(str(ref))
+        if isinstance(value, Exception):
+            raise value
+        if value is None:
+            raise TelegramBadRequest(method=None, message="chat not found")
+        return value
+
+    bot.get_chat.side_effect = _get_chat
     return bot
 
 
@@ -337,6 +407,39 @@ def reply_message_id(params):
     if isinstance(params, dict):
         return params.get("message_id")
     return getattr(params, "message_id", None)
+
+
+def keyboard_buttons(markup):
+    """``(text, callback_data)`` of every button of ``markup``, row by row.
+
+    Row-major order is the order the spec pins for the pickers (the
+    registry order of the chat buttons, ``Cancel`` last) — a set of
+    pairs could not express either.
+    """
+    assert markup is not None, "the inline keyboard must be attached to the question"
+    rows = markup["inline_keyboard"] if isinstance(markup, dict) else markup.inline_keyboard
+    buttons = []
+    for row in rows:
+        for button in row:
+            if isinstance(button, dict):
+                buttons.append((button.get("text"), button.get("callback_data")))
+            else:
+                buttons.append((button.text, button.callback_data))
+    return buttons
+
+
+def assert_spinner_cleared(callback) -> None:
+    """Every consumed ``w:*`` branch must end in an EMPTY ``callback.answer()``.
+
+    The spinner of the pressed button has to stop even when the branch
+    sends no visible text (the ignore cases); the pin is the call
+    itself, without any alert text.
+    """
+    assert callback.answer.await_count, "the click must clear the loading spinner"
+    call = callback.answer.await_args
+    assert not call.args and call.kwargs.get("text") is None, (
+        f"callback.answer() must be empty — no alert text: {call!r}"
+    )
 
 
 # --- helpers: messages -----------------------------------------------------
@@ -450,6 +553,38 @@ def make_admin_text(
     )
 
 
+def make_watcher_callback(
+    data,
+    *,
+    bot=None,
+    user_id=ADMIN_ID,
+    chat_id=TARGET_CHAT_ID,
+    username=TARGET_USERNAME,
+):
+    """A ``CallbackQuery``-shaped click on the prompt's inline keyboard.
+
+    The message it carries is the QUESTION message the keyboard is
+    attached to (id ``PROMPT_ID``), so the refusal/cancel branches can
+    answer and delete prompts exactly like the text path does.
+    """
+    bot = bot if bot is not None else make_bot()
+    message = SimpleNamespace(
+        message_id=PROMPT_ID,
+        chat=SimpleNamespace(id=chat_id, username=username, type="supergroup"),
+        from_user=None if user_id is None else SimpleNamespace(id=user_id),
+        text=QUESTION_SOURCE,
+        bot=bot,
+        answer=AsyncMock(name="answer"),
+    )
+    return SimpleNamespace(
+        data=data,
+        from_user=None if user_id is None else SimpleNamespace(id=user_id),
+        bot=bot,
+        message=message,
+        answer=AsyncMock(name="answer"),
+    )
+
+
 def session_ref(message_id=11, origin_message_id=501, date=D1, text="one"):
     """A batch ref for seeding a session directly through ``bot.sessions``."""
     return {
@@ -490,6 +625,39 @@ async def dispatch(message):
             await handler.callback(message)
             return handler
     return None
+
+
+async def dispatch_callback(callback):
+    """Run ``callback`` through the watcher router's callback handlers.
+
+    Mirrors ``dispatch`` above and ``dispatch_callback`` of
+    ``tests/test_settings.py``: the ``callback_query`` handlers are
+    checked in registration order and the first whose filters pass
+    consumes the event — ``None`` means no callback handler of this
+    router intercepted the click at all.
+    """
+    for handler in watcher_mod().router.callback_query.handlers:
+        passed, _ = await handler.check(callback)
+        if passed:
+            await handler.callback(callback)
+            return handler
+    return None
+
+
+def seed_asking_source(prompt_id=PROMPT_ID):
+    """A live batch waiting at the source question, seeded WITHOUT a forward.
+
+    The forward handler runs its own admin gate (and would refuse a
+    non-admin bot before any session exists), so the click tests —
+    which must pin the CLICK's own gate — start the session directly,
+    the same direct seeding ``seed_directly`` below provides for the
+    title stage.
+    """
+    session = sessions_mod().sessions.start(TARGET_CHAT_ID, session_ref())
+    session.stage = "asking_source"
+    session.source = None
+    session.add_prompt_id(prompt_id)
+    return session
 
 
 def pending(chat_id=TARGET_CHAT_ID):
@@ -567,25 +735,28 @@ async def start_conflicting_batch(bot):
     one pair per batch, so the bot has to re-open the source question
     (BRIEF «конфликт origin-ов в пачке → вопрос»).
     """
-    write_chats_config([*PAIRS, {"source": SECOND_SOURCE_ID, "target": TARGET_REF}])
+    await set_pairs([*PAIRS, {"source": SECOND_SOURCE_ID, "target": TARGET_REF}])
     await dispatch(make_forward(11, channel_origin(date=D1, message_id=501), bot=bot, text="one"))
     await dispatch(make_forward(12, second_pair_origin(date=D2), bot=bot, text="two"))
 
 
 class RecordingBuffer:
-    """A stand-in ``bot.buffer`` that records every ``find_and_take`` call.
+    """A stand-in ``bot.buffer`` whose ``find_and_take`` is an AsyncMock.
 
-    The watcher keeps a module-level ``buffer`` reference; swapping it
-    with ``monkeypatch.setattr`` lets a test observe EXACTLY what the
-    cleanup looks up — argument count, order and values — without
-    touching the real records.
+    The watcher keeps a module-level ``buffer`` reference and AWAITS
+    ``find_and_take`` (item 3: the buffer lives in the database), so
+    the stand-in must be awaitable — an ``AsyncMock`` with a capturing
+    ``side_effect``. Every lookup is recorded — argument count, order
+    and values — while reporting a plain miss (``None``), exactly the
+    contract of the old synchronous recorder.
     """
 
     def __init__(self):
         """Start with no captured calls."""
         self.calls: list[tuple[tuple, dict]] = []
+        self.find_and_take = AsyncMock(name="find_and_take", side_effect=self._capture)
 
-    def find_and_take(self, *args, **kwargs):
+    def _capture(self, *args, **kwargs):
         """Capture one lookup and report a plain miss."""
         self.calls.append((args, kwargs))
         return None
@@ -606,6 +777,26 @@ def lookup_sender(call):
         f"file_unique_id, sender_id) — got {len(args)} positional args: {args!r}"
     )
     return args[5]
+
+
+async def buffered_message_ids(chat_id) -> list[int]:
+    """``message_id`` of every buffered row of ``chat_id`` (item 3: the DB).
+
+    The buffer state is read from the ``buffer_messages`` table itself;
+    the imports live inside the helper on purpose (RED: ``bot.database``
+    / ``bot.models`` do not exist yet — a top-level import would abort
+    pytest collection for the whole suite).
+    """
+    from bot.database import session
+    from bot.models import BufferMessage
+
+    async with session() as db_session:
+        result = await db_session.execute(
+            select(BufferMessage)
+            .where(BufferMessage.chat_id == chat_id)
+            .order_by(BufferMessage.id)
+        )
+        return [row.message_id for row in result.scalars()]
 
 
 # ========================================================================
@@ -843,7 +1034,7 @@ class TestForwardAppendsToThePendingBatch:
 
     async def test_second_batch_in_another_target_chat_is_independent(self):
         """Two configured threaded chats batch at the same time (isolation)."""
-        write_chats_config([*PAIRS, {"source": -100222, "target": "@othergroup"}])
+        await set_pairs([*PAIRS, {"source": -100222, "target": "@othergroup"}])
         bot = make_bot()
         bot.send_message.side_effect = question_sender()
 
@@ -1159,7 +1350,7 @@ class TestExecutionOrder:
         # Only the third original was seen live in the source chat.
         import bot.buffer as buffer_module
 
-        buffer_module.buffer.record(SOURCE_ID, 403, OTHER_ADMIN_ID, D3, "three", None, None)
+        await buffer_module.buffer.record(SOURCE_ID, 403, OTHER_ADMIN_ID, D3, "three", None, None)
         title_message = make_admin_text(TITLE, bot=bot)
         timeline = build_timeline_spy(bot, title_message)
 
@@ -1438,7 +1629,7 @@ class TestSourceCleanup:
         assert pending().source == {"source": SOURCE_ID, "target": TARGET_REF}
         import bot.buffer as buffer_module
 
-        buffer_module.buffer.record(SOURCE_ID, 411, None, D1, "one", None, None)
+        await buffer_module.buffer.record(SOURCE_ID, 411, None, D1, "one", None, None)
         message = await run_title(bot, TITLE)
 
         cleaned = [arg(call_obj, "message_id", 1) for call_obj in source_deletes(bot)]
@@ -1483,8 +1674,8 @@ class TestSourceCleanup:
 
         # The second original was recorded with ANOTHER date → not found;
         # the third matches → found; the first is a configured channel origin.
-        buffer_module.buffer.record(SOURCE_ID, 402, 9, D1, "two", None, None)
-        buffer_module.buffer.record(SOURCE_ID, 403, OTHER_ADMIN_ID, D3, "three", None, None)
+        await buffer_module.buffer.record(SOURCE_ID, 402, 9, D1, "two", None, None)
+        await buffer_module.buffer.record(SOURCE_ID, 403, OTHER_ADMIN_ID, D3, "three", None, None)
 
         message = await run_title(bot)
 
@@ -1509,8 +1700,8 @@ class TestSourceCleanup:
         await seed_batch(bot, forwards)
         import bot.buffer as buffer_module
 
-        buffer_module.buffer.record(SOURCE_ID, 402, OTHER_ADMIN_ID, D2, "two", None, None)
-        buffer_module.buffer.record(SOURCE_ID, 403, OTHER_ADMIN_ID, D3, "three", None, None)
+        await buffer_module.buffer.record(SOURCE_ID, 402, OTHER_ADMIN_ID, D2, "two", None, None)
+        await buffer_module.buffer.record(SOURCE_ID, 403, OTHER_ADMIN_ID, D3, "three", None, None)
 
         def delete_side(*args, **kwargs):
             chat_id = kwargs.get("chat_id", args[0] if args else None)
@@ -1907,7 +2098,7 @@ class TestSourceCleanupMixedOrigins:
         # Only the second original was seen live in the session's source chat.
         import bot.buffer as buffer_module
 
-        buffer_module.buffer.record(SOURCE_ID, 412, None, D2, "two", None, None)
+        await buffer_module.buffer.record(SOURCE_ID, 412, None, D2, "two", None, None)
 
         message = await run_title(bot, TITLE)
 
@@ -1923,7 +2114,7 @@ class TestSourceCleanupMixedOrigins:
         assert reply_text(message) == created_reply(2, 2, 2), (
             "both originals were found — partial success is not needed here"
         )
-        assert buffer_module.buffer._chats.get(SOURCE_ID) == [], (
+        assert await buffered_message_ids(SOURCE_ID) == [], (
             "the buffer record was consumed by the lookup"
         )
         assert pending() is None, "the flow completed and reset the state"
@@ -1953,9 +2144,7 @@ class TestSourceCleanupMixedOrigins:
         assert reply_text(message) == created_reply(1, 1, 1), (
             "found WITHOUT any buffer record — the direct path really ran"
         )
-        import bot.buffer as buffer_module
-
-        assert not buffer_module.buffer._chats.get(SOURCE_ID), (
+        assert not await buffered_message_ids(SOURCE_ID), (
             "the direct path never consults the buffer"
         )
         assert pending() is None
@@ -2035,7 +2224,7 @@ class TestSourcePairBoundToCurrentChat:
         foreign-target pair → the exact СТОП literal, no title question,
         the state resets (the pair is not configured FOR THIS CHAT).
         """
-        write_chats_config([
+        await set_pairs([
             {"source": SOURCE_ID, "target": OTHER_TARGET_REF},
             {"source": SOURCE_ID, "target": "@thirdgroup"},
             {"source": THIRD_SOURCE_ID, "target": TARGET_REF},
@@ -2067,7 +2256,7 @@ class TestSourcePairBoundToCurrentChat:
         The batch must start with ``Which chat did you forward from?``—
         never with a silent jump to the title question (F4.2).
         """
-        write_chats_config([*PAIRS, {"source": SECOND_SOURCE_ID, "target": OTHER_TARGET_REF}])
+        await set_pairs([*PAIRS, {"source": SECOND_SOURCE_ID, "target": OTHER_TARGET_REF}])
         bot = make_bot()
         bot.send_message.side_effect = question_sender()
 
@@ -2430,7 +2619,7 @@ class TestConcurrentHandlersSerializePerChat:
         question is asked once as a reply to the FIRST batch message.
         """
         pin_filter_scheduling(monkeypatch)
-        write_chats_config([*PAIRS, {"source": SECOND_SOURCE_ID, "target": OTHER_TARGET_REF}])
+        await set_pairs([*PAIRS, {"source": SECOND_SOURCE_ID, "target": OTHER_TARGET_REF}])
         bot = yielding_bot(make_bot())
         first = make_forward(
             21, user_origin(date=D1), bot=bot,
@@ -2464,7 +2653,7 @@ class TestInvalidTargetAnswerEscaping:
 
         The refusal embeds the configured value inside an HTML-parsed
         message: raw ``<b>`` from the config would open a tag (markup
-        injection straight from ``chats.json``), so the answer must carry
+        injection straight from the pair registry), so the answer must carry
         ``&lt;b&gt;`` instead, with ``parse_mode="HTML"`` and a reset.
         """
         target = "<b>x"
@@ -2614,7 +2803,7 @@ class TestMediaExtractionAndAlbums:
         assert answer_message.answer.await_count == 0, "sanity: the transition is silent"
         import bot.buffer as buffer_module
 
-        buffer_module.buffer.record(
+        await buffer_module.buffer.record(
             SOURCE_ID, 404, OTHER_ADMIN_ID, D1, None, None, f"fu-{kind}"
         )
 
@@ -3027,3 +3216,498 @@ class TestAlbumGluedAfterChronologicalSort:
             "all three originals cleaned up — the move completed normally"
         )
         assert pending() is None, "the state resets"
+
+
+# ========================================================================
+# Inline source picker: the question's keyboard and its callbacks
+# ========================================================================
+
+
+class TestSourceQuestionKeyboard:
+    """The «Which chat…?» question carries the source buttons + Cancel (pin A1).
+
+    Labels come through ``bot.get_chat``: ``.title`` → ``.username``
+    rendered as ``@name`` → the ref itself, a RAISING ``get_chat``
+    reading as the ref too. Buttons follow the registry order, only
+    pairs whose target is the CURRENT chat qualify, ``Cancel`` is last.
+    """
+
+    async def test_the_source_question_lists_the_sources_of_this_chat_and_cancel(self):
+        """Registry order, the get_chat fallback chain, Cancel last (A1)."""
+        await set_pairs(
+            [
+                {"source": SOURCE_ID, "target": TARGET_REF},
+                {"source": SECOND_SOURCE_ID, "target": str(TARGET_CHAT_ID)},
+                {"source": "@mychannel", "target": TARGET_REF},
+                {"source": THIRD_SOURCE_ID, "target": OTHER_TARGET_REF},
+            ]
+        )
+        bot = make_bot(
+            chats={
+                str(SOURCE_ID): SimpleNamespace(title="Alpha", username="srcgroup"),
+                str(SECOND_SOURCE_ID): SimpleNamespace(
+                    title=None, username=SECOND_SOURCE_USERNAME
+                ),
+                "@mychannel": TelegramBadRequest(method=None, message="chat unavailable"),
+            }
+        )
+        bot.send_message.side_effect = question_sender()
+
+        await dispatch(make_forward(11, user_origin(date=D1), bot=bot))
+
+        question = bot.send_message.await_args
+        assert arg(question, "text", 1) == QUESTION_SOURCE, (
+            "the question text itself must not change"
+        )
+        assert arg(question, "reply_to_message_id") == 11, (
+            "the keyboard hangs on the question message of the batch"
+        )
+        assert keyboard_buttons(question.kwargs.get("reply_markup")) == [
+            ("Alpha", "w:src:-100111"),
+            ("@seconds", "w:src:-100333"),
+            ("@mychannel", "w:src:@mychannel"),
+            ("Cancel", "w:cancel"),
+        ], (
+            "registry order of the sources targeting THIS chat (the pair of "
+            "another chat excluded), labels through title -> username -> ref "
+            "(the raising get_chat falls back to the ref), Cancel last"
+        )
+
+    async def test_a_source_configured_by_two_pairs_renders_one_button(self):
+        """Duplicates by canonical ref collapse at their FIRST occurrence."""
+        await set_pairs(
+            [
+                {"source": SOURCE_ID, "target": TARGET_REF},
+                {"source": SECOND_SOURCE_ID, "target": TARGET_REF},
+                {"source": SOURCE_ID, "target": str(TARGET_CHAT_ID)},
+            ]
+        )
+        bot = make_bot(
+            chats={
+                str(SOURCE_ID): SimpleNamespace(title="Alpha"),
+                str(SECOND_SOURCE_ID): SimpleNamespace(title="Gamma"),
+            }
+        )
+        bot.send_message.side_effect = question_sender()
+
+        await dispatch(make_forward(11, user_origin(date=D1), bot=bot))
+
+        assert keyboard_buttons(bot.send_message.await_args.kwargs.get("reply_markup")) == [
+            ("Alpha", "w:src:-100111"),
+            ("Gamma", "w:src:-100333"),
+            ("Cancel", "w:cancel"),
+        ], "a source asked by two pairs must offer ONE button, at its first place"
+
+    async def test_the_title_question_carries_no_keyboard(self):
+        """Pin A2: only the source question gets the picker (GREEN in RED)."""
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+
+        await dispatch(make_forward(11, channel_origin(message_id=501), bot=bot))
+
+        question = bot.send_message.await_args
+        assert arg(question, "text", 1) == QUESTION_TITLE
+        assert question.kwargs.get("reply_markup") is None, (
+            "the title question must stay a plain prompt — no picker"
+        )
+
+    async def test_the_re_asked_source_question_carries_the_keyboard_too(self):
+        """The SECOND call site of the question (the F1 conflict re-ask)."""
+        await set_pairs([*PAIRS, {"source": SECOND_SOURCE_ID, "target": TARGET_REF}])
+        bot = make_bot(
+            chats={
+                str(SOURCE_ID): SimpleNamespace(title="Alpha"),
+                str(SECOND_SOURCE_ID): SimpleNamespace(title="Gamma"),
+            }
+        )
+        bot.send_message.side_effect = question_sender()
+
+        await dispatch(make_forward(11, channel_origin(date=D1, message_id=501), bot=bot))
+        await dispatch(make_forward(12, second_pair_origin(date=D2), bot=bot))
+
+        question = bot.send_message.await_args
+        assert arg(question, "text", 1) == QUESTION_SOURCE, (
+            "the conflict re-asks the very same question"
+        )
+        assert keyboard_buttons(question.kwargs.get("reply_markup")) == [
+            ("Alpha", "w:src:-100111"),
+            ("Gamma", "w:src:-100333"),
+            ("Cancel", "w:cancel"),
+        ], "the re-asked question is a source question and gets the picker as well"
+
+    async def test_an_empty_registry_asks_without_a_keyboard(self):
+        """No candidates → no ``reply_markup`` (the status quo, GREEN in RED).
+
+        The forward filter already refuses an unconfigured chat, so the
+        no-candidates branch is only reachable by calling the handler
+        directly — this pins what the picker must NOT do when the
+        registry names no source of this chat.
+        """
+        await set_pairs([])
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+
+        await watcher_mod().on_forward(make_forward(11, user_origin(date=D1), bot=bot))
+
+        question = bot.send_message.await_args
+        assert arg(question, "text", 1) == QUESTION_SOURCE
+        assert question.kwargs.get("reply_markup") is None, (
+            "no source buttons to offer — the question must stay keyboardless"
+        )
+
+
+class TestSourcePickerCallback:
+    """``w:src:<ref>`` — the click answer of the source question (pin A3)."""
+
+    @pytest.mark.parametrize(
+        "ref,pair",
+        [
+            pytest.param(
+                str(SOURCE_ID),
+                {"source": SOURCE_ID, "target": TARGET_REF},
+                id="numeric-ref",
+            ),
+            pytest.param(
+                "@srcgroup",
+                {"source": "@srcgroup", "target": TARGET_REF},
+                id="username-ref",
+            ),
+        ],
+    )
+    async def test_a_pick_resolves_the_pair_and_asks_the_title_question(self, ref, pair):
+        """A resolving button behaves exactly like the typed answer (step 2 → 3)."""
+        await set_pairs([pair])
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+        seed_asking_source()
+        callback = make_watcher_callback(f"w:src:{ref}", bot=bot)
+
+        consumed = await dispatch_callback(callback)
+
+        assert consumed is not None, "w:src:<ref> must be registered on the watcher router"
+        session = pending()
+        assert session is not None, "a resolving click keeps the batch alive"
+        assert session.stage == "asking_title"
+        assert session.source == pair, "the clicked source pair is fixed on the session"
+        assert bot.send_message.await_count == 1, "the title question is asked next"
+        question = bot.send_message.await_args
+        assert arg(question, "text", 1) == QUESTION_TITLE
+        assert arg(question, "chat_id", 0) == TARGET_CHAT_ID
+        assert arg(question, "reply_to_message_id") == 11, (
+            "the question hangs on the FIRST message of the batch"
+        )
+        assert callback.message.answer.await_count == 0, (
+            "the transition is announced by the next question, not an answer"
+        )
+        member = bot.get_chat_member.await_args
+        assert arg(member, "chat_id", 0) == TARGET_CHAT_ID, (
+            "the click's admin gate runs in the chat the button lives in"
+        )
+        assert arg(member, "user_id", 1) == ADMIN_ID
+        assert bot.get_chat_member.await_count == 1, "the click performs its OWN admin lookup"
+        assert_spinner_cleared(callback)
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            pytest.param("@unknown", id="ref-not-in-the-registry"),
+            pytest.param(str(THIRD_SOURCE_ID), id="pair-of-another-chat"),
+        ],
+    )
+    async def test_a_pick_naming_no_source_of_this_chat_stops_the_flow(self, ref):
+        """The terminal refusal of the text path: prompts gone, session reset."""
+        await set_pairs([*PAIRS, {"source": THIRD_SOURCE_ID, "target": OTHER_TARGET_REF}])
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+        seed_asking_source()
+        callback = make_watcher_callback(f"w:src:{ref}", bot=bot)
+
+        consumed = await dispatch_callback(callback)
+
+        assert consumed is not None, "the click is consumed — to refuse the flow"
+        assert reply_text(callback.message) == NOT_CONFIGURED_REPLY, (
+            "the refusal must be visible in the chat"
+        )
+        deletes = bot.delete_message.await_args_list
+        assert [(arg(c, "chat_id", 0), arg(c, "message_id", 1)) for c in deletes] == [
+            (TARGET_CHAT_ID, PROMPT_ID)
+        ], "the question message goes away with the session"
+        assert pending() is None, "the refusal is terminal — the batch resets"
+        assert bot.send_message.await_count == 0, "no title question after the refusal"
+        assert_spinner_cleared(callback)
+
+    async def test_a_pick_during_the_title_stage_is_ignored(self):
+        """A TEXT here would become the title — a BUTTON must change nothing."""
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+        seed_directly(session_ref())
+        callback = make_watcher_callback(f"w:src:{SOURCE_ID}", bot=bot)
+
+        consumed = await dispatch_callback(callback)
+
+        assert consumed is not None, "the click is consumed — and then ignored"
+        session = pending()
+        assert session.stage == "asking_title", "the stage must not move"
+        assert session.source == {"source": SOURCE_ID, "target": TARGET_REF}
+        assert callback.message.answer.await_count == 0, (
+            "no text may appear — a text answer here would become the title"
+        )
+        assert bot.send_message.await_count == 0, "no new question"
+        assert bot.delete_message.await_count == 0, "the prompt stays for the title"
+        assert_spinner_cleared(callback)
+
+    async def test_a_pick_without_a_session_is_ignored(self):
+        """No pending batch → the click changes nothing at all."""
+        bot = make_bot()
+        callback = make_watcher_callback(f"w:src:{SOURCE_ID}", bot=bot)
+
+        consumed = await dispatch_callback(callback)
+
+        assert consumed is not None, "w:src: is consumed even without a session to serve"
+        assert pending() is None, "a stray click must not create a session"
+        assert callback.message.answer.await_count == 0
+        bot.send_message.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+        assert_spinner_cleared(callback)
+
+    async def test_a_non_admins_pick_is_ignored(self):
+        """The click's own admin gate: a member's button changes nothing."""
+        bot = make_bot(status="member")
+        seed_asking_source()
+        callback = make_watcher_callback(f"w:src:{SOURCE_ID}", bot=bot)
+
+        consumed = await dispatch_callback(callback)
+
+        assert consumed is not None, "the click is consumed — to be gated"
+        session = pending()
+        assert session is not None and session.stage == "asking_source"
+        assert session.source is None, "the refused click must not fix a pair"
+        assert callback.message.answer.await_count == 0
+        bot.send_message.assert_not_awaited()
+        bot.delete_message.assert_not_awaited()
+        member = bot.get_chat_member.await_args
+        assert arg(member, "chat_id", 0) == TARGET_CHAT_ID
+        assert arg(member, "user_id", 1) == ADMIN_ID
+        assert_spinner_cleared(callback)
+
+    async def test_a_senderless_pick_is_ignored(self):
+        """``from_user is None`` → silent: no lookup, no reply, session alive."""
+        bot = make_bot()
+        seed_asking_source()
+        callback = make_watcher_callback(f"w:src:{SOURCE_ID}", bot=bot, user_id=None)
+
+        consumed = await dispatch_callback(callback)
+
+        assert consumed is not None, "the click is consumed — to be gated"
+        session = pending()
+        assert session is not None and session.stage == "asking_source"
+        assert callback.message.answer.await_count == 0
+        bot.get_chat_member.assert_not_awaited(), "no user id to look up"
+        bot.send_message.assert_not_awaited()
+        assert_spinner_cleared(callback)
+
+
+class TestCancelCallback:
+    """``w:cancel`` mirrors the ``/cancel`` command (pin A3)."""
+
+    @pytest.mark.parametrize(
+        "origin,expected_stage",
+        [
+            pytest.param(user_origin(date=D1), "asking_source", id="asking-source"),
+            pytest.param(channel_origin(message_id=501), "asking_title", id="asking-title"),
+        ],
+    )
+    async def test_the_cancel_button_deletes_the_prompts_and_resets(
+        self, origin, expected_stage
+    ):
+        """Both stages: the question message goes away, exactly ``Cancelled.``"""
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+        await dispatch(make_forward(11, origin, bot=bot))
+        assert pending().stage == expected_stage, "sanity: the seeded stage"
+        callback = make_watcher_callback("w:cancel", bot=bot)
+
+        consumed = await dispatch_callback(callback)
+
+        assert consumed is not None, "w:cancel must be registered on the watcher router"
+        assert reply_text(callback.message) == CANCELLED_REPLY, (
+            "the button mirrors /cancel: the same fixed literal, visible in the chat"
+        )
+        deletes = bot.delete_message.await_args_list
+        assert len(deletes) == 1, "exactly the question message is deleted"
+        assert arg(deletes[0], "chat_id", 0) == TARGET_CHAT_ID
+        assert arg(deletes[0], "message_id", 1) == PROMPT_ID
+        assert pending() is None, "the click resets the pending batch"
+        assert bot.send_message.await_count == 1, "no new question"
+        assert_spinner_cleared(callback)
+
+    async def test_a_non_admin_cannot_cancel_with_the_button(self):
+        """A member's button leaves the batch untouched (like their ``/cancel``)."""
+        bot = make_bot(status="member")
+        seed_asking_source()
+        callback = make_watcher_callback("w:cancel", bot=bot)
+
+        consumed = await dispatch_callback(callback)
+
+        assert consumed is not None, "the click is consumed — to be gated"
+        assert callback.message.answer.await_count == 0, "only admins may cancel"
+        assert pending() is not None, "the batch must stay pending"
+        bot.delete_message.assert_not_awaited()
+        assert_spinner_cleared(callback)
+
+    async def test_the_cancel_button_without_a_session_is_ignored(self):
+        """No pending batch → no reply, no deletion, nothing to reset."""
+        bot = make_bot()
+        callback = make_watcher_callback("w:cancel", bot=bot)
+
+        consumed = await dispatch_callback(callback)
+
+        assert consumed is not None, "w:cancel is consumed even without a session"
+        assert callback.message.answer.await_count == 0
+        bot.delete_message.assert_not_awaited()
+        assert pending() is None
+        assert_spinner_cleared(callback)
+
+
+# --- tests: the security-fix pins (fix package, RED phase) -------------------
+
+
+def patch_admin_cache_ttl(monkeypatch, value) -> None:
+    """Point the shared admin cache TTL constant at ``value`` (item 2).
+
+    The cache module is the fix's own contract: ``bot.admin_cache``
+    carries ONE module-level TTL constant — this helper accepts the
+    documented spellings and fails with a naming message when none of
+    them exists, so a wrong contract is a readable test failure.
+    """
+    try:
+        import bot.admin_cache as admin_cache
+    except ModuleNotFoundError:
+        raise AssertionError(
+            "bot.admin_cache must exist and expose a patchable TTL constant"
+        ) from None
+    for name in ("TTL", "CACHE_TTL", "ADMIN_CACHE_TTL", "TTL_SECONDS"):
+        if hasattr(admin_cache, name):
+            monkeypatch.setattr(admin_cache, name, value)
+            return
+    raise AssertionError(
+        "bot.admin_cache must expose one of TTL/CACHE_TTL/ADMIN_CACHE_TTL/TTL_SECONDS"
+    )
+
+
+class TestAdminGateTakesTheCachedStatus:
+    """H-2 + M-4: the watcher's user checks read the shared TTL cache."""
+
+    async def test_two_forwards_from_one_admin_hit_the_api_once(self):
+        """One (chat, user) lookup serves BOTH forwards of the same admin."""
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+
+        await dispatch(make_forward(11, channel_origin(message_id=501), bot=bot))
+        await dispatch(make_forward(12, channel_origin(message_id=502), bot=bot))
+
+        assert bot.get_chat_member.await_count == 1, (
+            "the second forward must be served from the shared admin cache"
+        )
+        session = pending()
+        assert session is not None, "both forwards belong to one batch"
+        assert len(session.messages) == 2, "and both of them joined it"
+
+    async def test_the_cached_status_holds_until_the_ttl_window_closes(
+        self, monkeypatch
+    ):
+        """Inside the window the cached answer wins; after it the API is asked."""
+        patch_admin_cache_ttl(monkeypatch, 0.2)
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+        await dispatch(make_forward(11, channel_origin(message_id=501), bot=bot))
+        bot.get_chat_member.return_value = SimpleNamespace(status="member")
+
+        await dispatch(make_forward(12, channel_origin(message_id=502), bot=bot))
+
+        session = pending()
+        assert session is not None, "the first forward starts the batch"
+        assert len(session.messages) == 2, (
+            "inside the TTL window the CACHED administrator status is served — "
+            "the switched fake must not be consulted yet"
+        )
+
+        await asyncio.sleep(0.25)
+        await dispatch(make_forward(13, channel_origin(message_id=503), bot=bot))
+
+        assert bot.get_chat_member.await_count == 2, (
+            "once the TTL window closed the status is looked up again"
+        )
+        session = pending()
+        assert session is not None, "the batch itself survives a refused forward"
+        assert len(session.messages) == 2, "the now non-admin forward does NOT join it"
+
+    async def test_a_failing_admin_lookup_ignores_the_forward_without_flooding(self):
+        """A raising ``get_chat_member`` = silent ignore, negatively cached."""
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+
+        async def raise_bad_request(*args, **kwargs):
+            raise TelegramBadRequest(method=None, message="user not found")
+
+        bot.get_chat_member.side_effect = raise_bad_request
+
+        await dispatch(make_forward(11, channel_origin(message_id=501), bot=bot))
+
+        assert pending() is None, "a failed admin lookup must not start a batch"
+        assert bot.send_message.await_count == 0, "and asks no question"
+        assert bot.get_chat_member.await_count == 1, "sanity: the lookup was made once"
+
+        await dispatch(make_forward(12, channel_origin(message_id=502), bot=bot))
+
+        assert pending() is None, "the repeat is ignored too"
+        assert bot.get_chat_member.await_count == 1, (
+            "the failed lookup is negatively cached — no API flood in the TTL window"
+        )
+        assert bot.send_message.await_count == 0, "still no question"
+
+
+class TestWatcherCallbacksWithoutAMessage:
+    """L-2.3: a ``w:*`` click Telegram delivers without a message is ignored."""
+
+    async def test_a_source_pick_without_a_message_leaves_the_batch_alone(self):
+        """No message to act on: spinner dies, the batch stays exactly as it was."""
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+        session = seed_asking_source()
+        click = SimpleNamespace(
+            data="w:src:-100111",
+            from_user=SimpleNamespace(id=ADMIN_ID),
+            bot=bot,
+            message=None,
+            answer=AsyncMock(name="answer"),
+        )
+
+        consumed = await dispatch_callback(click)
+
+        assert consumed is not None, "the click still matches the callback router"
+        assert_spinner_cleared(click)
+        assert pending() is session, "the batch stays where it was"
+        assert session.stage == "asking_source", "and still waits for the source"
+        assert bot.send_message.await_count == 0, "no question is asked for it"
+        assert bot.delete_message.await_count == 0, "and no prompt is deleted"
+
+    async def test_a_cancel_without_a_message_keeps_the_batch(self):
+        """No message to act on: the batch is NOT reset by a messageless click."""
+        bot = make_bot()
+        bot.send_message.side_effect = question_sender()
+        session = seed_asking_source()
+        click = SimpleNamespace(
+            data="w:cancel",
+            from_user=SimpleNamespace(id=ADMIN_ID),
+            bot=bot,
+            message=None,
+            answer=AsyncMock(name="answer"),
+        )
+
+        consumed = await dispatch_callback(click)
+
+        assert consumed is not None, "the click still matches the callback router"
+        assert_spinner_cleared(click)
+        assert pending() is session, "the batch must survive a messageless cancel"
+        assert bot.delete_message.await_count == 0, "no prompt deletion either"

@@ -1,21 +1,24 @@
 """aiogram dispatcher tests: module ``bot.dispatcher`` (BRIEF v3, §3/§5).
 
-v3 removes every command/live-mode router: the dispatcher is exactly
-``watcher → buffering``.
+v3 removes every command/live-mode router; cycle B adds the settings
+router: the dispatcher is exactly ``settings → watcher → buffering``.
 
 Specification (BRIEF.md v3):
 - ``create_dispatcher()`` returns an ``aiogram.Dispatcher`` — the
   assembly point from which polling starts;
 - assembling needs neither ``BOT_TOKEN`` nor network access;
-- the router tree carries exactly the two v3 routers, watcher FIRST:
-  the watcher's text-with-session handler and its forwards in the
-  threaded chat must consume those events before the buffering router
-  could ever see them (the chats do not overlap, so the order plus the
-  filters decide);
-- no command routers are wired anywhere: ``/thread``/``/target`` and
-  the v2 live-mode handlers (``bot.handlers.commands`` /
-  ``tracking`` / ``cleanup``) are gone with the v2 flow — no
-  ``Command`` filter survives in the tree;
+- the router tree carries exactly the three routers, in the order
+  settings → watcher → buffering: the settings router owns the private
+  chats (the ``/settings`` menu and its per-chat state machine) and
+  must consume those events first, then the watcher's
+  text-with-session handler and its forwards in the threaded chat run
+  before the buffering router could ever see them (the chats do not
+  overlap, so the order plus the filters decide);
+- no OTHER command routers are wired anywhere: ``/thread``/``/target``
+  and the v2 live-mode handlers (``bot.handlers.commands`` /
+  ``tracking`` / ``cleanup``) are gone with the v2 flow — the only
+  ``Command`` filter allowed in the tree is the settings router's
+  ``/settings``;
 - behaviour: an admin forwarding a batch into a configured threaded
   chat creates a pending session while the message runs through the
   real router pipeline (first handler whose filters pass consumes it),
@@ -28,7 +31,6 @@ still wired in. The two assembly tests of ``create_dispatcher()`` stay
 green in every phase.
 """
 
-import json
 import socket
 from datetime import datetime, timezone
 from pathlib import Path
@@ -38,11 +40,13 @@ from unittest.mock import AsyncMock
 import pytest
 from aiogram import Dispatcher
 from aiogram.filters import Command
+from sqlalchemy import select
 
 from bot.config import settings
 from bot.dispatcher import create_dispatcher
 
-#: The two routers of the v3 dispatcher, in order.
+#: The three routers of the dispatcher, in order (cycle B: settings first).
+SETTINGS_MODULE = "bot.handlers.settings"
 WATCHER_MODULE = "bot.handlers.watcher"
 BUFFERING_MODULE = "bot.handlers.buffering"
 
@@ -64,19 +68,41 @@ ADMIN_ID = 501
 ORIGIN_DATE = datetime(2026, 10, 5, 12, 0, 0, tzinfo=timezone.utc)
 
 
-@pytest.fixture(autouse=True)
-def configured_cwd(tmp_path: Path, monkeypatch):
-    """Run every test in a cwd whose ``chats.json`` holds ``PAIRS``.
+async def set_pairs(pairs) -> None:
+    """Replace the pair registry with ``pairs`` (the database is the source of truth).
 
-    Pure file operations on purpose: while ``bot.sessions`` /
-    ``bot.handlers.watcher`` do not exist (RED), this fixture must not
-    fail — only the tests themselves do. The shared pending-session
-    store is reset as well (it persists across tests by design).
+    Cycle A: the pairs live in the ``pairs`` table, so a registry
+    rewrite is a DELETE of whatever rows stand there followed by
+    ``add_pair`` inserts (each of them refreshes the cache). ``Pair``
+    is imported lazily so a missing model fails inside the seeding,
+    never at collection.
+    """
+    import bot.chats as chats_module
+    from bot.database import session
+    from bot.models import Pair
+
+    async with session() as db:
+        for row in (await db.execute(select(Pair))).scalars():
+            await db.delete(row)
+    for pair in pairs:
+        added = await chats_module.chats.add_pair(pair["source"], pair["target"])
+        assert added is True, f"seeding the pair {pair!r} must be accepted, got {added!r}"
+
+
+@pytest.fixture(autouse=True)
+async def configured_cwd(tmp_path: Path, monkeypatch, fresh_database):
+    """Run every test in a tmp cwd with the ``PAIRS`` registry seeded.
+
+    Cycle A: the registry is database-backed — seeding is the async
+    ``set_pairs`` (DELETE + ``add_pair``, which refreshes the cache);
+    the cwd only keeps the test isolated from the repository files.
+    The shared pending-session store is reset as well (it persists
+    across tests by design). The suite-wide ``fresh_database``
+    fixture of ``tests/conftest.py`` hands every test a fresh
+    in-memory database and reloads the pair cache for it.
     """
     monkeypatch.chdir(tmp_path)
-    Path.cwd().joinpath("chats.json").write_text(
-        json.dumps({"pairs": PAIRS}), encoding="utf-8"
-    )
+    await set_pairs(PAIRS)
     try:
         import bot.sessions as sessions_module
     except ModuleNotFoundError:
@@ -170,7 +196,36 @@ class TestCreateDispatcher:
 
 
 class TestRouterSetOrder:
-    """The tree is exactly ``watcher → buffering``, in that order."""
+    """The tree is exactly ``settings → watcher → buffering``, in that order."""
+
+    def test_the_settings_router_is_attached_before_watcher_and_buffering(self):
+        """Cycle B: the settings router is attached FIRST.
+
+        It owns the private chats (the ``/settings`` menu and the
+        per-chat add-pair state machine), so its handlers must see DM
+        events before the watcher or the buffering router could ever
+        look at them. A missing router is reported as such (RED: named
+        AssertionError, not an import error).
+        """
+        dispatcher = create_dispatcher()
+        settings_index = router_index_for_module(dispatcher, SETTINGS_MODULE)
+        watcher_index = router_index_for_module(dispatcher, WATCHER_MODULE)
+        buffering_index = router_index_for_module(dispatcher, BUFFERING_MODULE)
+
+        assert settings_index is not None, (
+            f"the settings router ({SETTINGS_MODULE}) must be attached to the dispatcher"
+        )
+        assert watcher_index is not None, (
+            f"the watcher router ({WATCHER_MODULE}) must be attached to the dispatcher"
+        )
+        assert buffering_index is not None, (
+            "the buffering router must stay attached to the dispatcher"
+        )
+        assert settings_index < watcher_index < buffering_index, (
+            "routers must be attached in the order settings → watcher → buffering, "
+            f"got settings at {settings_index}, watcher at {watcher_index}, "
+            f"buffering at {buffering_index}"
+        )
 
     def test_watcher_router_precedes_the_buffering_router(self):
         """Both v3 routers are attached, the watcher FIRST.
@@ -196,13 +251,14 @@ class TestRouterSetOrder:
             f"got watcher at {watcher_index}, buffering at {buffering_index}"
         )
 
-    def test_no_command_routers_are_wired(self):
+    def test_no_foreign_command_routers_are_wired(self):
         """``/thread``, ``/target`` and the v2 live-mode routers are gone.
 
         BRIEF v3 section 5: the command handlers, the step-8 tracker and
         the step-9 cleanup were deleted with the v2 flow — a leftover
         router would keep dead handlers (and their ``Command`` filters)
-        reachable.
+        reachable. The settings router's ``/settings`` command is the
+        ONE legitimate command of the tree (cycle B).
         """
         dispatcher = create_dispatcher()
         handlers = list(all_handlers(dispatcher))
@@ -210,9 +266,14 @@ class TestRouterSetOrder:
         command_filters = [
             handler for handler in handlers if handler_has_command_filter(handler)
         ]
-        assert not command_filters, (
-            "no Command filter may survive in the v3 dispatcher tree: "
-            f"{[handler.callback for handler in command_filters]!r}"
+        foreign_command_filters = [
+            handler
+            for handler in command_filters
+            if getattr(handler.callback, "__module__", None) != SETTINGS_MODULE
+        ]
+        assert not foreign_command_filters, (
+            "only the settings router (/settings) may carry a Command filter: "
+            f"{[handler.callback for handler in foreign_command_filters]!r}"
         )
 
         dead = [
