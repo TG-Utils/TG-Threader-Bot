@@ -20,8 +20,9 @@ Python 3, aiogram 3, pydantic-settings (`.env`). No web layer, no AI.
 ## Configuration
 
 - `.env` — copy from `.env.example`, set `BOT_TOKEN`, `DATABASE_URL`
-  and `OWNER_ID` (never commit `.env`); `LOCALE` selects the message
-  pack from `bot/locales/`.
+  and `OWNER_ID` (never commit `.env`); `LOCALE` selects the gettext
+  locale (catalogs in `bot/locales/`; untranslated locales fall back
+  to English).
 - `DATABASE_URL` — async SQLAlchemy URL, e.g.
   `postgresql+asyncpg://user@localhost:5432/tg_threader`; the bot fails
   fast at startup if it is missing or unreachable. Apply migrations with

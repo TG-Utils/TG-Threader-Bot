@@ -225,15 +225,23 @@ implemented in this repo (see §2).
     (a cached exception accumulates tracebacks per hit), and buffer
     write flood-protection (per-message INSERT+DELETE under spam).
 
-## 8. Repo state
+## 8. Repo requirements
 
-511 tests green, ruff clean (`--no-cache`). Iterations C+D (RED/GREEN
-for brief v3), the security fixes and the post-v1 backlog items are
-closed: async database layer (SQLAlchemy + Alembic: `buffer_messages`,
-`pairs` — the source buffer survives restarts), the `/settings` menu
-(ACL, add/delete flows, `getChat` titles), JSON language packs
-(`LOCALE`), GitHub Actions CI (ruff + pytest, Python 3.10/3.14) and the
-inline chat pickers (source question + add-flow prompts), hardened by a
-second security review (§7.10).
-The v3 flow has been verified live; migrations were applied to a real
-PostgreSQL 14.
+- Lint and tests stay green on every push: `ruff check --no-cache .`
+  and `pytest -q`, enforced by CI (`.github/workflows/ci.yml`) on
+  Python 3.10 and 3.14 for `main`/`develop`.
+- The v3 forward-batch flow works end to end: source question, thread
+  title, header → edit → flat-reply placement, albums glued per
+  `media_group_id`, best-effort forward deletion, source cleanup and
+  the success report with the deleted counter.
+- The async database layer (SQLAlchemy + Alembic: `buffer_messages`,
+  `pairs`) survives restarts, and migrations apply cleanly on a
+  fresh database.
+- `/settings` manages pairs with the pinned ACL and flows (list with
+  `getChat` titles, forward-origin or typed add, inline delete,
+  chat pickers).
+- Every user-facing reply is a natural string looked up through
+  gettext (`bot/i18n.py`, catalogs in `bot/locales/`) — never a
+  per-locale branch inside the handlers.
+- Secrets live only in `.env` (gitignored); errors and logs must not
+  leak DSNs or tokens.
