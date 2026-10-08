@@ -107,8 +107,8 @@ def restore_default_locale():
     try:
         i18n_module.set_locale("en")
     except FileNotFoundError:
-        # A missing en.json is reported by the pack tests themselves; the
-        # teardown must not turn their failure into collateral damage for
+        # A missing default pack is reported by the catalog tests themselves;
+        # the teardown must not turn their failure into collateral damage for
         # the OTHER tests of the suite.
         pass
 

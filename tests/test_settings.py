@@ -178,7 +178,7 @@ SECOND_PAIR = {"source": SECOND_SOURCE_ID, "target": SECOND_TARGET_REF}
 #: Timestamp of the fake messages (settings never reads it).
 D1 = datetime(2026, 10, 5, 12, 0, 0, tzinfo=timezone.utc)
 
-# --- literals of the locale pack (``bot/locales/en.json``, pinned by test_i18n) ---
+# --- reply literals (msgids pinned into bot/locales/messages.pot by test_i18n) ---
 
 FORBIDDEN = "You are not allowed to manage settings."
 NO_PAIRS = "No pairs configured yet."
