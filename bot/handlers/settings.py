@@ -69,8 +69,9 @@ to the other routers:
 - messages outside any state that are not ``/settings`` are never
   intercepted — the watcher and the buffering routers keep their events.
 
-Every reply is a locale-pack key rendered by ``t()`` at the moment it
-is sent — the texts themselves live in ``bot/locales`` only.
+Every reply is a natural string looked up through gettext (``_``) at
+the moment it is sent — translated copies live in the catalogs under
+``bot/locales``, never in this module.
 """
 
 import logging
@@ -84,7 +85,7 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 from bot import admin_cache
 from bot.chats import chats, is_same_chat, origin_chat_ref, parse_chat_ref
 from bot.config import settings
-from bot.i18n import t
+from bot.i18n import translate as _
 from bot.keyboards import chat_title, picker_keyboard
 
 #: Module logger — swallowed menu edits are logged at DEBUG, never raised.
@@ -202,11 +203,12 @@ async def _admins_confirm_pair(bot: Bot, source: Any, target: Any, user_id: Any)
 async def _confirm_verdict(bot: Bot, state: MenuState, caller: Any) -> tuple[bool, str]:
     """Verdict of the ``st:yes`` rechecks for a NON-owner caller (N1b).
 
-    Returns ``(ok, refusal_key)``: ``ok`` is the FINAL bool of the pair
+    Returns ``(ok, refusal)``: ``ok`` is the FINAL bool of the pair
     of rechecks — «the caller admins BOTH chats of the confirmed pair»
     AND «the bot may still move» — the FIRST denying step making it
-    ``False``, and ``refusal_key`` names that step's alert (``""``
-    while ``ok``).
+    ``False``, and ``refusal`` holds that step's alert as a NATURAL
+    string (``""`` while ``ok``), ready for the gettext lookup at the
+    call site.
 
     The verdict of ``(caller_id, str(source), str(target))`` lives in
     ``bot.admin_cache`` for ``FRESH_TTL`` seconds, so a hammered
@@ -223,10 +225,10 @@ async def _confirm_verdict(bot: Bot, state: MenuState, caller: Any) -> tuple[boo
     refusal = ""
     ok = bool(await _admins_confirm_pair(bot, state.source, state.target, caller))
     if not ok:
-        refusal = "settings.forbidden"
+        refusal = "You are not allowed to manage settings."
     elif not await _bot_may_move(bot, state.source, state.target):
         ok = False
-        refusal = "settings.bot_not_admin"
+        refusal = "I must be an admin with the Delete Messages permission in both chats of a pair."
     verdict = (ok, refusal)
     admin_cache.remember_confirm_verdict(caller, state.source, state.target, verdict)
     return verdict
@@ -321,10 +323,10 @@ async def _picker_keyboard(bot: Bot) -> InlineKeyboardMarkup | None:
 
 def _menu_keyboard(pair_count: int) -> InlineKeyboardMarkup:
     """The always-present creation button plus the removal one at pairs > 0."""
-    rows = [[InlineKeyboardButton(text=t("settings.add_button"), callback_data="st:add")]]
+    rows = [[InlineKeyboardButton(text=_("Add pair"), callback_data="st:add")]]
     if pair_count:
         rows.append(
-            [InlineKeyboardButton(text=t("settings.delete_button"), callback_data="st:del")]
+            [InlineKeyboardButton(text=_("Delete pair"), callback_data="st:del")]
         )
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -332,8 +334,8 @@ def _menu_keyboard(pair_count: int) -> InlineKeyboardMarkup:
 def _confirm_keyboard() -> InlineKeyboardMarkup:
     """The two buttons of the confirmation prompt."""
     rows = [
-        [InlineKeyboardButton(text=t("settings.confirm_button"), callback_data="st:yes")],
-        [InlineKeyboardButton(text=t("settings.cancel_button"), callback_data="st:no")],
+        [InlineKeyboardButton(text=_("Confirm"), callback_data="st:yes")],
+        [InlineKeyboardButton(text=_("Cancel"), callback_data="st:no")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -341,14 +343,14 @@ def _confirm_keyboard() -> InlineKeyboardMarkup:
 async def _render_menu(bot: Bot) -> tuple[str, InlineKeyboardMarkup]:
     """The menu text plus its keyboard, rendered FRESH on every call."""
     pairs = chats.all_pairs()
-    lines = [t("settings.menu_title", n=len(pairs))]
+    lines = [_("Pair settings ({n}):").format(n=len(pairs))]
     if pairs:
         for pair in pairs:
             source_title = await chat_title(bot, pair["source"])
             target_title = await chat_title(bot, pair["target"])
             lines.append(f"{source_title} → {target_title}")
     else:
-        lines.append(t("settings.no_pairs"))
+        lines.append(_("No pairs configured yet."))
     return "\n".join(lines), _menu_keyboard(len(pairs))
 
 
@@ -420,7 +422,7 @@ async def _refuse_when_forbidden(callback: CallbackQuery) -> bool:
     sender = getattr(callback, "from_user", None)
     if await can_manage(getattr(sender, "id", None), callback.bot):
         return False
-    await callback.answer(t("settings.forbidden"))
+    await callback.answer(_("You are not allowed to manage settings."))
     return True
 
 
@@ -481,7 +483,7 @@ async def on_settings(message: Message) -> None:
     states.pop(message.chat.id, None)
     sender = getattr(message, "from_user", None)
     if not await can_manage(getattr(sender, "id", None), message.bot):
-        await message.answer(t("settings.forbidden"))
+        await message.answer(_("You are not allowed to manage settings."))
         return
     text, markup = await _render_menu(message.bot)
     await message.answer(text, reply_markup=markup)
@@ -490,7 +492,7 @@ async def on_settings(message: Message) -> None:
 async def on_cancel(message: Message) -> None:
     """``/cancel`` during an open step: drop the state, confirm it."""
     states.pop(message.chat.id, None)
-    await message.answer(t("watcher.cancelled"))
+    await message.answer(_("Cancelled."))
 
 
 async def on_pending(message: Message) -> None:
@@ -513,32 +515,38 @@ async def _advance_with_ref(message: Message, state: MenuState, ref: int | str |
     through HERE, so the two answers can never drift apart.
     """
     if ref is None:
-        await message.answer(t("settings.invalid_input"))
+        await message.answer(
+            _("Not a chat reference. Send a forwarded message, @username or numeric id.")
+        )
         return
     if state.step == STEP_WAIT_SOURCE:
         state.source = ref
         state.step = STEP_WAIT_TARGET
         await message.answer(
-            t("settings.send_target"),
+            _("Now do the same for the target chat: forward a message or send @username or id."),
             reply_markup=await _picker_keyboard(message.bot),
         )
         return
     if state.step != STEP_WAIT_TARGET:
         # The confirmation waits for its buttons, not for free text.
-        await message.answer(t("settings.invalid_input"))
+        await message.answer(
+            _("Not a chat reference. Send a forwarded message, @username or numeric id.")
+        )
         return
     if is_same_chat(state.source, ref):
-        await message.answer(t("settings.self_pair"))
+        await message.answer(_("Source and target are the same chat."))
         return
     if not await _bot_may_move(message.bot, state.source, ref):
-        await message.answer(t("settings.bot_not_admin"))
+        await message.answer(
+            _("I must be an admin with the Delete Messages permission in both chats of a pair.")
+        )
         return
     state.target = ref
     state.step = STEP_CONFIRM
     source_title = await chat_title(message.bot, state.source)
     target_title = await chat_title(message.bot, ref)
     await message.answer(
-        t("settings.confirm_prompt", source=source_title, target=target_title),
+        _("Add pair: {source} → {target}?").format(source=source_title, target=target_title),
         reply_markup=_confirm_keyboard(),
     )
 
@@ -558,7 +566,7 @@ async def on_add(callback: CallbackQuery) -> None:
     states[chat_id] = MenuState(step=STEP_WAIT_SOURCE)
     await _edit_or_ignore(
         callback.message,
-        t("settings.send_source"),
+        _("Send a message forwarded from the source chat, or its @username or id."),
         reply_markup=await _picker_keyboard(callback.bot),
     )
     await callback.answer()
@@ -572,7 +580,7 @@ async def on_delete(callback: CallbackQuery) -> None:
         return
     pairs = chats.all_pairs()
     if not pairs:
-        await callback.answer(t("settings.no_pairs"))
+        await callback.answer(_("No pairs configured yet."))
         return
     rows = []
     for pair in pairs:
@@ -586,10 +594,10 @@ async def on_delete(callback: CallbackQuery) -> None:
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text=t("settings.back_button"), callback_data="st:back")])
+    rows.append([InlineKeyboardButton(text=_("Back"), callback_data="st:back")])
     await _edit_or_ignore(
         callback.message,
-        t("settings.delete_prompt"),
+        _("Select a pair to remove:"),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
     await callback.answer()
@@ -616,12 +624,12 @@ async def on_delete_chosen(callback: CallbackQuery) -> None:
         if pair is not None and not await _admins_confirm_pair(
             callback.bot, pair["source"], pair["target"], caller
         ):
-            await callback.answer(t("settings.forbidden"))
+            await callback.answer(_("You are not allowed to manage settings."))
             return
     removed = pair_id is not None and await chats.remove_pair(pair_id)
     text, markup = await _render_menu(callback.bot)
     await _edit_or_ignore(callback.message, text, reply_markup=markup)
-    await callback.answer(t("settings.pair_removed") if removed else t("settings.no_pairs"))
+    await callback.answer(_("Pair removed.") if removed else _("No pairs configured yet."))
 
 
 async def on_back(callback: CallbackQuery) -> None:
@@ -669,19 +677,19 @@ async def on_confirm(callback: CallbackQuery) -> None:
     if not _is_owner(caller):
         ok, refusal = await _confirm_verdict(callback.bot, state, caller)
         if not ok:
-            await callback.answer(t(refusal))
+            await callback.answer(_(refusal))
             return
     if not await chats.add_pair(state.source, state.target):
         # The pair is already there — the confirmation stays open so the
         # user can still back out of it.
-        await callback.answer(t("settings.duplicate_pair"))
+        await callback.answer(_("This pair already exists."))
         return
     states.pop(_menu_chat_id(callback), None)
     text, markup = await _render_menu(callback.bot)
     await _edit_or_ignore(callback.message, text, reply_markup=markup)
     source_title = await chat_title(callback.bot, state.source)
     target_title = await chat_title(callback.bot, state.target)
-    alert = t("settings.pair_added", source=source_title, target=target_title)
+    alert = _("Pair added: {source} → {target}.").format(source=source_title, target=target_title)
     if len(alert) > ALERT_TEXT_LIMIT:
         # N9: two 128-char titles render 272 chars — the beginning (the
         # pinned prefix included) is what has to survive the cut.
@@ -704,7 +712,7 @@ async def on_decline(callback: CallbackQuery) -> None:
     if state is None or state.step != STEP_CONFIRM:
         return
     states.pop(_menu_chat_id(callback), None)
-    await _edit_or_ignore(callback.message, t("watcher.cancelled"))
+    await _edit_or_ignore(callback.message, _("Cancelled."))
     await callback.answer()
 
 
@@ -745,7 +753,7 @@ async def on_pick_cancel(callback: CallbackQuery) -> None:
         await callback.answer()
         return
     states.pop(_menu_chat_id(callback), None)
-    await callback.message.answer(t("watcher.cancelled"))
+    await callback.message.answer(_("Cancelled."))
     await callback.answer()
 
 

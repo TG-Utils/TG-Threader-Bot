@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     bot_token: str = ""
     log_level: str = "INFO"
-    #: Locale pack applied at startup (``LOCALE``, pack in ``bot/locales``).
+    #: Locale applied at startup (``LOCALE``, gettext catalog in ``bot/locales``).
     locale: str = "en"
     #: Database DSN of the bot (``DATABASE_URL``, item 1): empty string →
     #: the startup aborts before ``Bot()`` is built — never a ValidationError.

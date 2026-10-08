@@ -19,6 +19,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
     "aiosqlite>=0.20",
+    "Babel>=2.13",
 ]
 
 [build-system]
@@ -29,7 +30,11 @@ build-backend = "setuptools.build_meta"
 include = ["bot*"]
 
 [tool.setuptools.package-data]
-bot = ["locales/*.json"]
+bot = [
+    "locales/*.pot",
+    "locales/*/LC_MESSAGES/*.po",
+    "locales/*/LC_MESSAGES/*.mo",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

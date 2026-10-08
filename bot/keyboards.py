@@ -26,7 +26,7 @@ from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot import admin_cache
-from bot.i18n import t
+from bot.i18n import translate as _
 
 #: Telegram's hard limit for one ``callback_data`` payload, in bytes.
 CALLBACK_DATA_LIMIT = 64
@@ -117,5 +117,5 @@ async def picker_keyboard(
         )
     if not rows:
         return None
-    rows.append([InlineKeyboardButton(text=t("settings.cancel_button"), callback_data=cancel_data)])
+    rows.append([InlineKeyboardButton(text=_("Cancel"), callback_data=cancel_data)])
     return InlineKeyboardMarkup(inline_keyboard=rows)

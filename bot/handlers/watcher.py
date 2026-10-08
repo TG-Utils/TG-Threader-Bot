@@ -33,9 +33,9 @@ question asked), ``w:cancel`` mirrors ``/cancel`` at any stage — both
 read and write the session under the chat's lock (F6) and end every
 branch in an EMPTY ``callback.answer()``.
 
-Every reply is a key of the locale pack (``bot.i18n``), rendered by
-``t()`` at the moment it is sent — the texts themselves live in
-``bot/locales`` only.
+Every reply is a natural string looked up through gettext (``_``)
+when it is sent — translated copies live in the catalogs under
+``bot/locales``, never in this module.
 
 The message handlers serialize on a per-chat ``asyncio.Lock`` (F6)
 taken BEFORE the session state is read, so concurrent admins can never
@@ -63,7 +63,7 @@ from bot.chats import (
     pair_is_registered,
     pair_targets_chat,
 )
-from bot.i18n import t
+from bot.i18n import translate as _
 from bot.keyboards import picker_keyboard
 from bot.services.threads import build_thread_url
 from bot.sessions import STAGE_ASKING_SOURCE, STAGE_ASKING_TITLE, Session, sessions
@@ -77,12 +77,13 @@ SOURCE_PICK_PREFIX = "w:src:"
 #: ``callback_data`` of the source picker's trailing button.
 CANCEL_PICK = "w:cancel"
 
-# Every reply of this module is a locale-pack key (``bot/locales``),
-# rendered by ``t()`` at the MOMENT of the answer: no reply text lives
-# in the sources, and a locale switched mid-flight applies to the next
-# reply. Dynamic fragments (sizes, the thread link, the title, the
-# offending target) are HTML-escaped HERE, before ``t()`` embeds them —
-# the escaping semantics of the former renderer, kept byte for byte.
+# Every reply of this module is a natural string looked up via the
+# gettext seam (``_``) at the MOMENT of the answer: the msgid lives in
+# this source, the translated copy in ``bot/locales``, and a locale
+# switched mid-flight applies to the next reply. Dynamic fragments
+# (sizes, the thread link, the title, the offending target) are
+# HTML-escaped HERE, before ``_()`` embeds them — the escaping
+# semantics of the former renderer, kept byte for byte.
 
 #: Guard: batches over the limit are refused with the REAL size.
 BATCH_LIMIT = 100
@@ -487,7 +488,11 @@ async def _execute(message: Message, session: Session, title: str) -> None:
 
     size = len(refs)
     if size > BATCH_LIMIT:
-        await _refuse(message, session, t("watcher.batch_too_large", n=size))
+        await _refuse(
+            message,
+            session,
+            _("Batch too large ({n} messages, limit 100). Nothing was moved.").format(n=size),
+        )
         return
 
     try:
@@ -496,7 +501,9 @@ async def _execute(message: Message, session: Session, title: str) -> None:
         await _refuse(
             message,
             session,
-            t("watcher.invalid_target", target=html.escape(str(target_ref))),
+            _("Invalid target chat in configuration: {target}. Nothing was moved.").format(
+                target=html.escape(str(target_ref))
+            ),
         )
         return
 
@@ -508,7 +515,7 @@ async def _execute(message: Message, session: Session, title: str) -> None:
         # F4: the pair went stale (deleted from the config or bound to
         # another chat) → «не настроено»: no send/edit/copy/delete of
         # any chat, only the bot's own questions go away.
-        await _refuse(message, session, t("watcher.not_configured"))
+        await _refuse(message, session, _("This chat is not configured as a source chat."))
         return
 
     # Step 4: aiogram hands the batch over in ARRIVAL order, which is
@@ -520,10 +527,12 @@ async def _execute(message: Message, session: Session, title: str) -> None:
 
     try:
         escaped_title = html.escape(title[:TITLE_MAX_LENGTH], quote=True)
-        header_text = t("thread.header_template", title=escaped_title)
+        header_text = _("Topic: <b>{title}</b>").format(title=escaped_title)
         header = await bot.send_message(chat_id=chat_id, text=header_text, parse_mode="HTML")
         thread_url = build_thread_url(target_ref, header.message_id)
-        link_line = t("thread.link_line", thread_url=html.escape(thread_url, quote=True))
+        link_line = _(
+            'Please use <a href="{thread_url}">this link</a> to respond to this thread.'
+        ).format(thread_url=html.escape(thread_url, quote=True))
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=header.message_id,
@@ -533,7 +542,13 @@ async def _execute(message: Message, session: Session, title: str) -> None:
         await _place_batch(bot, chat_id, ordered, header.message_id)
     except Exception as error:
         # The type name, not str(error): the fixed line must stay stable.
-        await _refuse(message, session, t("watcher.move_failed", error=type(error).__name__))
+        await _refuse(
+            message,
+            session,
+            _("Move failed: {error}. Check the target chat manually.").format(
+                error=type(error).__name__
+            ),
+        )
         return
 
     # F10: the forwarded copies are deleted best-effort — every delete
@@ -549,8 +564,10 @@ async def _execute(message: Message, session: Session, title: str) -> None:
     await _delete_prompts(bot, chat_id, session)
     reply = "\n".join(
         (
-            t("watcher.created_line", n=size, thread_url=html.escape(thread_url, quote=True)),
-            t("watcher.deleted_line", x=deleted, y=size),
+            _("Thread created: {n} message(s). {thread_url}").format(
+                n=size, thread_url=html.escape(thread_url, quote=True)
+            ),
+            _("Deleted {x} of {y} original messages.").format(x=deleted, y=size),
         )
     )
     try:
@@ -588,7 +605,13 @@ async def on_forward(message: Message) -> None:
                 # F5: refuse BEFORE appending — an unbounded batch is a
                 # memory-amplification vector; the cap state stays intact
                 # for the report and then the session resets.
-                await _refuse(message, session, t("watcher.batch_too_large", n=size))
+                await _refuse(
+                    message,
+                    session,
+                    _("Batch too large ({n} messages, limit 100). Nothing was moved.").format(
+                        n=size
+                    ),
+                )
                 return
             if session.source is not None:
                 pair = pair_for_origin(ref["origin"], message.chat)
@@ -602,7 +625,7 @@ async def on_forward(message: Message) -> None:
                         message.bot,
                         chat_id,
                         session,
-                        t("watcher.source_question"),
+                        _("Which chat did you forward from? Reply with @username or its id."),
                         reply_markup=await _source_picker(message.bot, message.chat),
                     )
                     return
@@ -615,7 +638,9 @@ async def on_forward(message: Message) -> None:
             # The origin identifies a pair of THIS chat — fix it, skip question 1.
             session.source = pair
             session.stage = STAGE_ASKING_TITLE
-            await _ask_or_reset(message.bot, chat_id, session, t("watcher.title_question"))
+            await _ask_or_reset(
+                message.bot, chat_id, session, _("Thread title? Send the title as a plain message.")
+            )
         else:
             # No pair of this chat in the origin (F4: a pair of ANOTHER
             # chat does not count) → ask where the batch came from.
@@ -625,7 +650,7 @@ async def on_forward(message: Message) -> None:
                 message.bot,
                 chat_id,
                 session,
-                t("watcher.source_question"),
+                _("Which chat did you forward from? Reply with @username or its id."),
                 reply_markup=await _source_picker(message.bot, message.chat),
             )
 
@@ -651,7 +676,7 @@ async def on_text(message: Message) -> None:
 
         if _is_cancel(text):
             await _delete_prompts(message.bot, chat_id, session)
-            await message.answer(t("watcher.cancelled"), parse_mode="HTML")
+            await message.answer(_("Cancelled."), parse_mode="HTML")
             sessions.reset(chat_id)
             return
 
@@ -660,17 +685,19 @@ async def on_text(message: Message) -> None:
             if pair is None or not pair_targets_chat(pair, message.chat):
                 # «не настроено → СТОП» (F4: a pair of ANOTHER chat reads
                 # as «не настроено» HERE): no thread, no cleanup, reset.
-                await _refuse(message, session, t("watcher.not_configured"))
+                await _refuse(message, session, _("This chat is not configured as a source chat."))
                 return
             session.source = pair
             session.stage = STAGE_ASKING_TITLE
-            await _ask_or_reset(message.bot, chat_id, session, t("watcher.title_question"))
+            await _ask_or_reset(
+                message.bot, chat_id, session, _("Thread title? Send the title as a plain message.")
+            )
             return
 
         title = text.strip()
         if not title:
             # Keep waiting for a real title: the batch and prompts stay.
-            await message.answer(t("watcher.empty_title"), parse_mode="HTML")
+            await message.answer(_("Title is empty — send the thread title."), parse_mode="HTML")
             return
         await _execute(message, session, title)
 
@@ -740,11 +767,13 @@ async def on_source_pick(callback: CallbackQuery) -> None:
             if pair is None or not pair_targets_chat(pair, message.chat):
                 # «не настроено → СТОП» (F4): the refusal is visible in
                 # the chat, the prompts go away, the batch resets.
-                await _refuse(message, session, t("watcher.not_configured"))
+                await _refuse(message, session, _("This chat is not configured as a source chat."))
             else:
                 session.source = pair
                 session.stage = STAGE_ASKING_TITLE
-                await _ask_or_reset(message.bot, chat_id, session, t("watcher.title_question"))
+                await _ask_or_reset(
+                message.bot, chat_id, session, _("Thread title? Send the title as a plain message.")
+            )
     await callback.answer()
 
 
@@ -765,7 +794,7 @@ async def on_source_cancel(callback: CallbackQuery) -> None:
         session = sessions.get(chat_id)
         if session is not None:
             await _delete_prompts(message.bot, chat_id, session)
-            await message.answer(t("watcher.cancelled"), parse_mode="HTML")
+            await message.answer(_("Cancelled."), parse_mode="HTML")
             sessions.reset(chat_id)
     await callback.answer()
 
