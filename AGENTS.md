@@ -38,6 +38,9 @@ python3 -m venv .venv
 .venv/bin/ruff check .     # lint, must be clean
 ```
 
+CI (`.github/workflows/ci.yml`) runs both on push/PR to
+`main`/`develop` (Python 3.10 and 3.14).
+
 ## TDD workflow
 
 **Tests are the specification.** Code is written only to make failing tests pass.
@@ -87,37 +90,8 @@ Roles are OpenCode subagents defined in `.opencode/agents/`:
 > unsafe defaults. Format: severity → file:line → issue → recommendation.
 > Change nothing.
 
-## Current state and backlog
 
-- The test suite is green (314 tests), ruff clean (`ruff check --no-cache`).
-  Implemented per `BRIEF.md` (v3): config (`.env` + `chats.json` pairs,
-  fresh-read, normalized-ref self-pair rejection, pair↔target binding),
-  template renderer (`{{vars}}` + `[a]label[/a]`, strict URL validation,
-  HTML escaping), thread/message URL builders, source-chat live buffer
-  (`bot/buffer.py`: `record` + `find_and_take` with date + sender +
-  text/caption/`file_unique_id`, consumed matches), chat-pairs registry
-  (`bot/chats.py`: `target_for`, `pair_for_source_ref`,
-  `pair_for_origin`, `is_source`, `is_configured_target`,
-  `pair_targets_chat`), pending sessions (`bot/sessions.py`), the
-  forward-batch state machine + execution
-  (`bot/handlers/watcher.py`: source/title questions, `/cancel`,
-  accumulation cap 100, per-chat `asyncio.Lock`, header → edit →
-  media-group/copy placement → best-effort forward deletion → source
-  cleanup → success report), source buffering
-  (`bot/handlers/buffering.py`), dispatcher (watcher → buffering).
-- Security reviews are closed through iterations C/D: H1 mixed-origin
-  deletion scoping + origin-conflict re-ask, M1 sender/caption matching,
-  M2 question/final-answer failure resilience, M3 pair must match the
-  current chat, M5 accumulation cap, M6 per-chat lock, L1 target
-  escaping, L2 non-text inputs ignored + `/cancel@bot`, L4 multi-type
-  media extraction, L10 forward deletion best-effort, I2 normalized
-  self-pair. Notes carried into `BRIEF.md` §7: shared-administration
-  invariant, reply-correlation option.
-- Backlog: rate limiting / admin cooldown, `TelegramRetryAfter`
-  handling, mtime-cache for `chats.json` reads, admin-status TTL cache,
-  pruning of long-lived stores, `SecretStr` for BOT_TOKEN, UTF-16-aware
-  title truncation, anonymous-admin handling, dependency lockfile,
-  structured logging, reply-correlation option (accept title/source
-  answers only as replies to the bot's question), `chats.json` privacy
-  scrub before any publish, wiki sync (Tech-stack, forward-flow
-  deviations), persistence of pending sessions/buffer across restarts.
+## State and backlog
+
+The living state, security-review status and backlog live in
+`PLAN.md` — this file stays base-only (per the PR #2 review).

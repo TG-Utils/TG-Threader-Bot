@@ -28,7 +28,7 @@ from bot import config as config_module
 from bot.config import Settings
 
 #: Environment variable names that control the project settings.
-PROJECT_ENV_VARS = ("BOT_TOKEN", "LOG_LEVEL")
+PROJECT_ENV_VARS = ("BOT_TOKEN", "LOG_LEVEL", "LOCALE", "DATABASE_URL", "OWNER_ID")
 
 
 @pytest.fixture(autouse=True)
@@ -101,6 +101,77 @@ class TestSettings:
         settings = Settings()
 
         assert settings.log_level == "WARNING"
+
+    def test_locale_default_is_en(self, env):
+        """Specification (i18n, backlog 5): the default locale is ``en``."""
+        settings = Settings()
+
+        assert settings.locale == "en"
+
+    def test_locale_read_from_env(self, env):
+        """Specification: the locale is picked up from the ``LOCALE`` variable."""
+        env.setenv("LOCALE", "ru")
+
+        assert Settings().locale == "ru"
+
+    def test_database_url_default_is_empty(self, env):
+        """Specification (item 1, DB): ``database_url`` defaults to an empty string.
+
+        The field must NOT be required: the suite constructs
+        ``Settings()`` all over the place with no database in the
+        environment, and an absent ``DATABASE_URL`` is an empty value
+        (like ``BOT_TOKEN``), not a ``ValidationError``.
+        """
+        settings = Settings()  # must not raise ValidationError
+
+        assert settings.database_url == ""
+
+    def test_database_url_read_from_env(self, env):
+        """Specification (item 1, DB): ``DATABASE_URL`` reaches ``settings.database_url``.
+
+        The same pickup pattern as ``LOCALE``: the environment value
+        lands in the field exactly as it was exported.
+        """
+        env.setenv("DATABASE_URL", "postgresql+asyncpg://bot@localhost/tg")
+
+        assert Settings().database_url == "postgresql+asyncpg://bot@localhost/tg"
+
+    def test_owner_id_defaults_to_none(self, env):
+        """Specification (cycle B, settings ACL): ``owner_id`` defaults to ``None``.
+
+        No ``OWNER_ID`` in the environment means «the owner is not
+        configured» — until ``.env`` carries ``OWNER_ID=<id>`` the
+        settings menu can only be opened by an admin of a pair chat.
+        The field must NOT be required: the suite builds ``Settings()``
+        everywhere without an owner in the environment.
+        """
+        settings = Settings()  # must not raise ValidationError
+
+        assert settings.owner_id is None
+
+    def test_owner_id_read_from_env_as_an_integer(self, env):
+        """Specification: the numeric ``OWNER_ID`` string reaches the field as ``int``.
+
+        ``env`` already removes OWNER_ID, so the value can only come
+        from the environment — and the comparison pins the type too
+        (the string ``"123456789"`` never equals ``123456789``).
+        """
+        env.setenv("OWNER_ID", "123456789")
+
+        assert Settings().owner_id == 123456789
+
+    def test_empty_owner_id_is_none_not_a_validation_error(self, env):
+        """Specification: an empty ``OWNER_ID`` means «no owner», not an error.
+
+        ``.env`` files routinely carry ``OWNER_ID=`` while an operator
+        edits them — an empty string must come out as ``None``, never
+        as a ``ValidationError``.
+        """
+        env.setenv("OWNER_ID", "")
+
+        settings = Settings()  # must not raise ValidationError
+
+        assert settings.owner_id is None
 
     def test_web_fields_are_gone_from_settings(self, env):
         """Specification change (cycle 6): no web part — no web settings.
@@ -193,3 +264,50 @@ class TestDotEnvFile:
         monkeypatch.chdir(tmp_path)
 
         assert Settings().log_level == "DEBUG"
+
+    def test_locale_read_from_dotenv_file(self, env, tmp_path, monkeypatch):
+        """Specification (i18n): ``LOCALE`` is read from ``.env`` too.
+
+        ``env`` already removes LOCALE from the environment, so the
+        value can only come from the file.
+        """
+        (tmp_path / ".env").write_text("LOCALE=ru\n", encoding="utf-8")
+        monkeypatch.chdir(tmp_path)
+
+        assert Settings().locale == "ru"
+
+
+class TestLogLevelValidation:
+    """I-2: ``log_level`` is normalised to a logging level name and validated."""
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            pytest.param("debug", "DEBUG", id="debug"),
+            pytest.param("info", "INFO", id="info"),
+            pytest.param("warning", "WARNING", id="warning"),
+            pytest.param("error", "ERROR", id="error"),
+            pytest.param("critical", "CRITICAL", id="critical"),
+        ],
+    )
+    def test_a_lowercase_level_is_uppercased(self, env, value, expected):
+        """Every lowercase level name arrives uppercased at ``settings.log_level``."""
+        assert Settings(log_level=value).log_level == expected, (
+            f"{value!r} must be normalised to {expected!r}"
+        )
+
+    def test_an_already_uppercase_level_passes_through(self, env):
+        """An uppercased value is kept exactly as it was written."""
+        assert Settings(log_level="INFO").log_level == "INFO"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("nope", id="not-a-level-name"),
+            pytest.param("", id="empty-value"),
+        ],
+    )
+    def test_a_junk_level_is_refused(self, env, value):
+        """A value that names no logging level is a configuration error."""
+        with pytest.raises(ValueError):
+            Settings(log_level=value)

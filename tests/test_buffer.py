@@ -1,50 +1,54 @@
 """Source-chat buffer tests: module ``bot.buffer`` (BRIEF v3, section 5).
 
-RED phase (iteration D, security review F2): ``find_and_take`` still
-takes FIVE arguments and ignores the caption and the sender — every
-lookup test below fails with ``TypeError`` (the new 6th argument) or
-with a wrong predicate verdict (the ``buffer_mod()`` helper imports the
-module inside the tests on purpose: at top level a missing or changed
-module would abort pytest collection for the whole suite).
+The buffer is DATABASE-backed since item 3 (the buffer lives in the
+DB): every
+recorded message is a row of the ``buffer_messages`` table
+(``bot.models.BufferMessage``) inside the engine configured through
+``bot.database`` — the suite-wide autouse fixture of
+``tests/conftest.py`` gives every test a fresh
+``sqlite+aiosqlite:///:memory:`` database.
 
-Specification (BRIEF.md v3, section «Что возвращается / удаляется из v2»
-and section «Шаг 5. Подчистка основного чата»):
-- the buffer is the BASE FOR SEARCHING ORIGINALS of the main (source)
-  chat — the bot records every source-chat message it sees live (the
-  Bot API history does not exist, so pre-start messages are unfindable);
-- ``record(chat_id, message_id, user_id, date, text, caption,
-  file_unique_id)`` stores one message: its id, the author, the update
-  timestamp (a ``datetime``), the text and/or caption of the message and
-  the media's ``file_unique_id`` (``None`` for plain text messages);
-- ``find_and_take(chat_id, date, text, caption, file_unique_id,
-  sender_id)`` looks the original up and returns its ``message_id`` —
-  or ``None``:
-  * a match requires an equal ``date``, an equal SENDER — the forward
-    origin's author (``sender_user.id`` / ``sender_chat.id``) on the
-    lookup side against the record's ``user_id``; either side unknown
-    → the sender condition is skipped — AND the payload: a non-empty
-    ``text`` must be equal; else a non-empty ``caption`` must be equal;
-    else a non-``None`` ``file_unique_id`` must be equal (BRIEF step 5:
-    media without text is identified by date + file id);
-  * the FIRST match in insertion order wins;
-  * a found record is CONSUMED (taken): a repeated lookup of the same
-    original returns ``None`` — the cleanup must never issue a second
-    ``delete_message`` for one original;
-  * lookups are scoped to a single chat: another chat's records are
-    invisible, an unknown chat is a plain ``None``;
-- the cap behaviour survives: the ``maxlen`` constructor parameter
-  bounds how many records a chat keeps and the OLDEST records are
-  evicted first (an evicted original is simply not found — in v3 that
-  only means "nothing to delete", never a wrong delete);
-- the module exposes the shared singleton ``buffer = ChatBuffer()``;
-- the stored record covers every field listed above (pinned directly
-  against the ``_chats`` layout this module has used since v2);
-- the buffer is in-memory only: a restart loses it (BRIEF «Объём v1»),
-  which the cleanup reports honestly as ``Deleted 0 of Y``.
+RED phase: ``bot.database`` / ``bot.models`` do not exist yet, and the
+buffer API is still synchronous. The helpers import those modules
+INSIDE the test bodies on purpose (a top-level import would abort
+pytest collection for the whole suite), so the tests fail with
+``ModuleNotFoundError`` / ``TypeError`` (``await`` on the current
+sync ``record``) while the collection stays clean.
+
+Specification (BRIEF.md v3 §5 + item-3 pins):
+- ``buffer = ChatBuffer(maxlen=1000)`` — the shared module singleton;
+- ``await buffer.record(chat_id, message_id, user_id, date, text,
+  caption, file_unique_id)`` INSERTS one row:
+  * a repeated record of the same ``(chat_id, message_id)`` leaves ONE
+    row and never raises (Telegram may re-deliver an update);
+  * ``date`` is stored as NAIVE UTC (``aware → astimezone(UTC)
+    .replace(tzinfo=None)``): the same INSTANT in any zone finds it —
+    a record seen at ``10:00+03:00`` matches a lookup at
+    ``07:00+00:00``, and a naive lookup date reads as UTC;
+  * after the insert the chat is PRUNED: only the ``maxlen`` freshest
+    rows of that chat survive (the oldest are deleted), other chats
+    untouched;
+- ``await buffer.find_and_take(chat_id, date, text, caption,
+  file_unique_id, sender_id) -> int | None``:
+  * dates compare BY INSTANT (aware UTC, naive-UTC, any zone);
+  * payload predicate: a non-empty ``text`` → equal text; else a
+    non-empty ``caption`` → equal caption; else
+    ``file_unique_id is not None`` → equal ``file_unique_id`` (BRIEF
+    step 5: media without text is identified by date + file id);
+  * sender: both sides non-``None`` → they must be equal; either side
+    ``None`` → the condition is skipped;
+  * the FIRST match in insertion order (``id`` ASC) wins, lookups are
+    scoped to one chat;
+  * taking = DELETING the row: a repeated lookup of the same original
+    returns ``None`` (one original is never deleted twice);
+- the module exposes the shared singleton ``buffer = ChatBuffer()``.
 """
 
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from sqlalchemy import select
 
 #: Two chats that must stay isolated from each other.
 CHAT_A = -1001
@@ -54,6 +58,13 @@ CHAT_B = -1002
 D1 = datetime(2026, 10, 5, 12, 0, 0, tzinfo=timezone.utc)
 D2 = datetime(2026, 10, 5, 12, 5, 0, tzinfo=timezone.utc)
 
+#: The SAME instant as D_UTC_0700, seen from the +03:00 zone.
+D_KZ = datetime(2026, 10, 5, 10, 0, 0, tzinfo=timezone(timedelta(hours=3)))
+#: The same instant in UTC — ``D_KZ == D_UTC_0700`` by instant.
+D_UTC_0700 = datetime(2026, 10, 5, 7, 0, 0, tzinfo=timezone.utc)
+#: Naive: the convention reads a naive timestamp as UTC.
+D_NAIVE_0700 = datetime(2026, 10, 5, 7, 0, 0)
+
 #: The text of a plain text message used across the tests.
 TEXT = "moderation note"
 
@@ -61,32 +72,38 @@ TEXT = "moderation note"
 def buffer_mod():
     """The ``bot.buffer`` module, imported at test time.
 
-    While the v3 API does not exist (RED), every test fails with
-    ``ModuleNotFoundError`` on its first helper call. The import lives
-    inside this function on purpose: at top level a missing module
-    would abort the collection of the whole pytest run and would be
-    classified as third-party by ruff, flipping ``I001`` once the file
-    exists.
+    The import lives inside this function on purpose: at top level a
+    missing module would abort the collection of the whole pytest run
+    and would be classified as third-party by ruff, flipping ``I001``
+    once the file exists.
     """
     import bot.buffer as buffer_module
 
     return buffer_module
 
 
-def stored_records(buf, chat_id) -> list:
-    """The raw records of ``chat_id`` as the buffer keeps them.
+async def stored_rows(chat_id) -> list:
+    """The ``BufferMessage`` rows of ``chat_id``, oldest first.
 
-    The record STRUCTURE is part of the specification (BRIEF v3 §5:
-    «записи: message_id, дата, текст/подпись, file_unique_id»), so one
-    test of this file looks inside — against the ``_chats`` layout the
-    module has documented since v2 (a chat id mapped to a list of dict
-    records).
+    The row STRUCTURE is part of the specification (BRIEF v3 §5: the
+    record covers message_id, date, text/caption, file_unique_id), so
+    the structure
+    tests look at the table itself instead of at an in-memory layout.
     """
-    return buf._chats[chat_id]
+    from bot.database import session
+    from bot.models import BufferMessage
+
+    async with session() as db_session:
+        result = await db_session.execute(
+            select(BufferMessage)
+            .where(BufferMessage.chat_id == chat_id)
+            .order_by(BufferMessage.id)
+        )
+        return list(result.scalars())
 
 
 class TestFindAndTake:
-    """``find_and_take(chat_id, date, text, caption, file_unique_id, sender_id)``.
+    """``await find_and_take(chat_id, date, text, caption, file_unique_id, sender_id)``.
 
     The search contract of the cleanup step (BRIEF v3, step 5): the
     original is located by the forward-origin date plus the SENDER of
@@ -94,163 +111,312 @@ class TestFindAndTake:
     caption, or the ``file_unique_id`` of media without both.
     """
 
-    def test_text_message_is_found_by_date_and_text(self):
+    async def test_text_message_is_found_by_date_and_text(self):
         """date + non-empty text both equal → the record's ``message_id``."""
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
+        await buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
 
-        assert buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) == 10
+        assert await buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) == 10
 
-    def test_a_found_record_is_consumed(self):
-        """The taken original is gone: a repeated lookup must be ``None``.
+    async def test_a_found_record_is_consumed(self):
+        """The taken original is gone from the TABLE: a repeat → ``None``.
 
         The cleanup deletes the original once — a second lookup of the
         same original (a later duplicate forward, a retry) must not
         produce a second ``delete_message``.
         """
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
+        await buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
 
-        first = buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100)
-        second = buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100)
+        first = await buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100)
+        second = await buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100)
 
         assert first == 10, "sanity: the first lookup finds the original"
         assert second is None, "a taken original must never be found again"
+        assert await stored_rows(CHAT_A) == [], "taking means DELETING the row"
 
-    def test_the_first_match_in_insertion_order_wins(self):
+    async def test_the_first_match_in_insertion_order_wins(self):
         """Two identical originals → the older one first, then the newer."""
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
-        buf.record(CHAT_A, 11, 100, D1, TEXT, None, None)
+        await buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
+        await buf.record(CHAT_A, 11, 100, D1, TEXT, None, None)
 
-        assert buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) == 10, (
+        assert await buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) == 10, (
             "insertion order: the record recorded first must be taken first"
         )
-        assert buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) == 11
-        assert buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) is None
+        assert await buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) == 11
+        assert await buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) is None
 
-    def test_the_date_must_match(self):
-        """A record taken with another timestamp is not the original."""
+    async def test_the_date_must_match(self):
+        """A record taken with another instant is not the original."""
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
+        await buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
 
-        assert buf.find_and_take(CHAT_A, D2, TEXT, None, None, 100) is None, (
+        assert await buf.find_and_take(CHAT_A, D2, TEXT, None, None, 100) is None, (
             "the forward-origin date must equal the recorded update date"
         )
 
-    def test_the_text_must_match(self):
-        """Equal date alone is not enough — the text differs."""
+    async def test_dates_match_by_the_instant_in_any_timezone(self):
+        """``10:00+03:00`` IS ``07:00+00:00`` — and a naive date reads as UTC.
+
+        The storage convention of item 3: ``sent_at`` holds NAIVE UTC,
+        so every representation of one instant resolves to the same
+        row and a naive lookup is read as UTC.
+        """
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
+        await buf.record(CHAT_A, 10, 100, D_KZ, TEXT, None, None)
+        await buf.record(CHAT_A, 11, 100, D_UTC_0700, TEXT, None, None)
 
-        assert buf.find_and_take(CHAT_A, D1, "a different message", None, None, 100) is None
+        rows = await stored_rows(CHAT_A)
+        assert [row.sent_at for row in rows] == [D_NAIVE_0700, D_NAIVE_0700], (
+            "sent_at must be stored as naive UTC (no offset information)"
+        )
+        assert all(row.sent_at.tzinfo is None for row in rows), "stored rows are naive"
 
-    def test_media_without_text_is_matched_by_file_unique_id(self):
+        assert await buf.find_and_take(CHAT_A, D_UTC_0700, TEXT, None, None, 100) == 10, (
+            "a record seen at 10:00+03:00 must be found at 07:00+00:00"
+        )
+        assert await buf.find_and_take(CHAT_A, D_NAIVE_0700, TEXT, None, None, 100) == 11, (
+            "a naive lookup date is read as UTC"
+        )
+
+    async def test_media_without_text_is_matched_by_file_unique_id(self):
         """A captioned photo: no text → date + ``file_unique_id``.
 
-        This is the BRIEF step-5 rule «медиа без текста → (дата +
-        file_unique_id)»: the caption travels with the record but the
+        This is the BRIEF step-5 rule «media without text → (date +
+        file_unique_id)»: the caption travels with the row but the
         identity of a media original is its file id.
         """
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, None, "photo caption", "f-abc123")
+        await buf.record(CHAT_A, 10, 100, D1, None, "photo caption", "f-abc123")
 
-        assert buf.find_and_take(CHAT_A, D1, None, None, "f-abc123", 100) == 10
+        assert await buf.find_and_take(CHAT_A, D1, None, None, "f-abc123", 100) == 10
 
-    def test_empty_text_also_falls_back_to_the_file_id(self):
-        """``text=""`` counts as «no text» exactly like ``text=None``."""
+    @pytest.mark.parametrize(
+        "record, lookup, expected",
+        [
+            pytest.param(
+                {"text": "", "caption": None, "file_unique_id": "f-abc123"},
+                {"text": "", "caption": None, "file_unique_id": "f-abc123"},
+                10,
+                id="empty-text-falls-back-to-the-file-id",
+            ),
+            pytest.param(
+                {"text": None, "caption": "photo caption", "file_unique_id": "f-uploaded"},
+                {"text": None, "caption": "photo caption", "file_unique_id": "f-forward"},
+                10,
+                id="the-caption-identifies-a-captioned-media",
+            ),
+            pytest.param(
+                {"text": None, "caption": "cap A", "file_unique_id": "f-same"},
+                {"text": None, "caption": "cap B", "file_unique_id": "f-same"},
+                None,
+                id="another-caption-is-another-original",
+            ),
+            pytest.param(
+                {"text": None, "caption": None, "file_unique_id": None},
+                {"text": None, "caption": None, "file_unique_id": None},
+                None,
+                id="no-file-id-on-either-side-is-a-miss",
+            ),
+            pytest.param(
+                {"text": None, "caption": None, "file_unique_id": None},
+                {"text": None, "caption": None, "file_unique_id": "f-abc123"},
+                None,
+                id="a-file-id-the-bot-never-recorded-is-a-miss",
+            ),
+            pytest.param(
+                {"text": None, "caption": None, "file_unique_id": "f-abc"},
+                {"text": None, "caption": "photo caption", "file_unique_id": "f-abc"},
+                None,
+                id="caption-branch-against-a-record-without-a-caption",
+            ),
+            pytest.param(
+                {"text": TEXT, "caption": None, "file_unique_id": "f-abc123"},
+                {"text": "other text", "caption": None, "file_unique_id": "f-abc123"},
+                None,
+                id="a-text-record-is-not-matched-by-file-id-alone",
+            ),
+            pytest.param(
+                {"text": TEXT, "caption": "photo caption", "file_unique_id": "f-abc"},
+                {"text": "other text", "caption": "photo caption", "file_unique_id": "f-abc"},
+                None,
+                id="text-branch-misses-even-with-equal-caption-and-file",
+            ),
+            pytest.param(
+                {"text": TEXT, "caption": "photo caption", "file_unique_id": "f-abc"},
+                {"text": TEXT, "caption": "another caption", "file_unique_id": "f-other"},
+                10,
+                id="equal-text-wins-over-a-differing-caption",
+            ),
+        ],
+    )
+    async def test_the_payload_predicate_is_text_then_caption_then_file_id(
+        self, record, lookup, expected
+    ):
+        """The BRIEF step-5 payload chain: text → caption → ``file_unique_id``."""
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, "", None, "f-abc123")
-
-        assert buf.find_and_take(CHAT_A, D1, "", None, "f-abc123", 100) == 10
-
-    def test_media_match_requires_a_file_id_on_both_sides(self):
-        """No file id recorded or queried → the media original is not found."""
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, None, None, None)
-
-        assert buf.find_and_take(CHAT_A, D1, None, None, None, 100) is None, (
-            "a record without a file id cannot be identified as media"
+        await buf.record(
+            CHAT_A, 10, 100, D1, record["text"], record["caption"], record["file_unique_id"]
         )
-        assert buf.find_and_take(CHAT_A, D1, None, None, "f-abc123", 100) is None, (
-            "a file id the bot never recorded is a miss, not a guess"
+
+        found = await buf.find_and_take(
+            CHAT_A,
+            D1,
+            lookup["text"],
+            lookup["caption"],
+            lookup["file_unique_id"],
+            100,
         )
 
-    def test_a_text_record_is_not_matched_by_file_id_alone(self):
-        """A non-empty text switches the lookup to the text branch.
+        assert found == expected, f"record {record!r} vs lookup {lookup!r}"
 
-        The file id of a text-carrying record must not identify it:
-        otherwise a wrong original could be deleted (security review).
-        """
+
+class TestSenderPredicate:
+    """The sender half of the predicate (security review F2).
+
+    The forward origin carries the sender (``sender_user.id`` /
+    ``sender_chat.id``), the row carries the author (``user_id``), and
+    the condition applies only when BOTH sides are known: an unknown
+    sender on either side skips it, so senderless origins and records
+    keep behaving exactly as before.
+    """
+
+    @pytest.mark.parametrize(
+        "recorded_user, lookup_sender, expected",
+        [
+            pytest.param(100, 100, 10, id="equal-senders-match"),
+            pytest.param(100, 200, None, id="another-author-is-another-original"),
+            pytest.param(100, None, 10, id="unknown-sender-on-the-lookup-side-skips"),
+            pytest.param(None, 42, 10, id="unknown-sender-on-the-record-side-skips"),
+        ],
+    )
+    async def test_the_sender_condition_needs_both_sides(
+        self, recorded_user, lookup_sender, expected
+    ):
+        """Both known → equality enforced; either ``None`` → condition skipped."""
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, "f-abc123")
+        await buf.record(CHAT_A, 10, recorded_user, D1, TEXT, None, None)
 
-        assert buf.find_and_take(CHAT_A, D1, "other text", None, "f-abc123", 100) is None
+        found = await buf.find_and_take(CHAT_A, D1, TEXT, None, None, lookup_sender)
 
-    def test_unknown_chat_is_a_miss(self):
-        """A chat with no records at all → ``None``, never an error."""
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
-
-        assert buf.find_and_take(CHAT_B, D1, TEXT, None, None, 100) is None
+        assert found == expected, (
+            f"record user_id={recorded_user!r} vs lookup sender={lookup_sender!r}"
+        )
 
 
 class TestChatIsolation:
     """Records of one chat never satisfy a lookup in another chat."""
 
-    def test_identical_payloads_resolve_to_their_own_chat(self):
-        """The same (date, text) exists in both chats → each lookup its own id."""
+    async def test_identical_payloads_resolve_to_their_own_chat(self):
+        """Unknown chat misses; the same (date, text) in two chats → own ids."""
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
-        buf.record(CHAT_B, 20, 200, D1, TEXT, None, None)
+        assert await buf.find_and_take(CHAT_B, D1, TEXT, None, None, 100) is None, (
+            "an unknown chat is a plain miss, never an error"
+        )
 
-        assert buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) == 10, (
+        await buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
+        await buf.record(CHAT_B, 20, 200, D1, TEXT, None, None)
+
+        assert await buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) == 10, (
             "chat A must resolve to chat A's record"
         )
-        assert buf.find_and_take(CHAT_B, D1, TEXT, None, None, 200) == 20, (
+        assert await buf.find_and_take(CHAT_B, D1, TEXT, None, None, 200) == 20, (
             "chat B must resolve to chat B's record"
         )
 
 
-class TestRecordedRecordStructure:
-    """The stored record covers every field the cleanup may need."""
+class TestDeduplication:
+    """Re-delivered updates (item 3): one row, no exception."""
 
-    def test_record_carries_every_field(self):
-        """``record`` stores message_id, user_id, date, text, caption, file id."""
+    async def test_recording_the_same_message_twice_keeps_one_row(self):
+        """A repeated ``(chat_id, message_id)`` neither crashes nor doubles."""
         buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, "hello", "cap", "f-1")
+        await buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
+        await buf.record(CHAT_A, 10, 100, D1, "duplicate", None, None)
 
-        record = stored_records(buf, CHAT_A)[0]
+        rows = await stored_rows(CHAT_A)
 
-        assert isinstance(record, dict), "a record is a plain dict (v2 layout)"
-        expected_keys = {
-            "message_id",
-            "user_id",
-            "date",
-            "text",
-            "caption",
-            "file_unique_id",
-        }
-        assert expected_keys <= set(record), (
-            f"the record must cover every cleanup field {expected_keys}: {record!r}"
+        assert len(rows) == 1, "the (chat_id, message_id) uniqueness dedups re-deliveries"
+        assert rows[0].message_id == 10
+
+
+class TestRecordedRowStructure:
+    """The stored row covers every field the cleanup may need."""
+
+    async def test_record_carries_every_field(self):
+        """``record`` stores chat/message/user ids, date, text, caption, file id."""
+        buf = buffer_mod().ChatBuffer()
+        await buf.record(CHAT_A, 10, 100, D1, "hello", "cap", "f-1")
+
+        rows = await stored_rows(CHAT_A)
+
+        assert len(rows) == 1, "one record() call → one row"
+        row = rows[0]
+        assert row.chat_id == CHAT_A
+        assert row.message_id == 10
+        assert row.user_id == 100, "the author travels with the row"
+        assert row.sent_at == D1.replace(tzinfo=None), (
+            "the update timestamp drives the search and is stored as naive UTC"
         )
-        assert record["message_id"] == 10
-        assert record["user_id"] == 100, "the author travels with the record"
-        assert record["date"] == D1, "the update timestamp drives the search"
-        assert record["text"] == "hello"
-        assert record["caption"] == "cap", "the caption is part of the record"
-        assert record["file_unique_id"] == "f-1"
+        assert row.text == "hello"
+        assert row.caption == "cap", "the caption is part of the record"
+        assert row.file_unique_id == "f-1"
+        assert row.created_at is not None, "created_at carries a Python default"
 
-    def test_the_record_signature_is_unchanged(self):
-        """``record`` keeps its 7-argument signature — ``user_id`` IS the sender.
 
-        The forwarding side derives the sender from the forward origin
-        (``sender_user.id`` / ``sender_chat.id``) and the buffer already
-        stores it as ``user_id``: nothing new has to be recorded (F2).
+class TestCapacity:
+    """The cap: ``ChatBuffer(maxlen=...)`` prunes the OLDEST rows per chat.
+
+    In v3 pruning only ever means «the original is not in the buffer»
+    (a skipped delete) — never a wrong match elsewhere.
+    """
+
+    async def test_oldest_records_are_pruned_at_the_cap(self):
+        """A chat over the cap keeps only the newest ``maxlen`` rows."""
+        buf = buffer_mod().ChatBuffer(maxlen=3)
+        for offset in range(4):
+            await buf.record(CHAT_A, 1 + offset, 100 + offset, D1, f"m{offset}", None, None)
+
+        assert await buf.find_and_take(CHAT_A, D1, "m0", None, None, 100) is None, (
+            "the record pruned by the cap must not be found"
+        )
+        assert await buf.find_and_take(CHAT_A, D1, "m3", None, None, 103) == 4, (
+            "the newest record must survive the cap"
+        )
+        assert await buf.find_and_take(CHAT_A, D1, "m1", None, None, 101) == 2, (
+            "records inside the cap are untouched"
+        )
+
+    async def test_the_cap_is_per_chat(self):
+        """Each chat keeps up to ``maxlen`` rows of its own."""
+        buf = buffer_mod().ChatBuffer(maxlen=2)
+        await buf.record(CHAT_A, 1, 1, D1, "a1", None, None)
+        await buf.record(CHAT_A, 2, 1, D1, "a2", None, None)
+        await buf.record(CHAT_A, 3, 1, D1, "a3", None, None)
+        await buf.record(CHAT_B, 5, 2, D1, "b1", None, None)
+
+        assert await buf.find_and_take(CHAT_A, D1, "a1", None, None, 1) is None, (
+            "chat A is at its cap: its oldest record was pruned"
+        )
+        assert await buf.find_and_take(CHAT_A, D1, "a3", None, None, 1) == 3
+        assert await buf.find_and_take(CHAT_B, D1, "b1", None, None, 2) == 5, (
+            "chat B is below the cap: unaffected by chat A's overflow"
+        )
+
+
+class TestBufferApi:
+    """The public surface of ``bot.buffer`` pinned against the handlers."""
+
+    def test_the_record_and_lookup_signatures_are_unchanged(self):
+        """7-argument ``record``, 6-argument ``find_and_take`` — exactly.
+
+        ``user_id`` IS the sender (the forwarding side derives it from
+        the forward origin), and ``sender_id`` is the 6th argument of
+        the cleanup lookup (F2) — nothing may be added or reordered.
         """
-        params = list(inspect.signature(buffer_mod().ChatBuffer.record).parameters)
-
-        assert params == [
+        record_params = list(inspect.signature(buffer_mod().ChatBuffer.record).parameters)
+        assert record_params == [
             "self",
             "chat_id",
             "message_id",
@@ -259,79 +425,10 @@ class TestRecordedRecordStructure:
             "text",
             "caption",
             "file_unique_id",
-        ], f"record must keep exactly its v3 signature: {params!r}"
+        ], f"record must keep exactly its signature: {record_params!r}"
 
-
-class TestCapacity:
-    """The cap: ``ChatBuffer(maxlen=...)`` evicts the oldest records.
-
-    In v3 eviction only ever means «the original is not in the buffer»
-    (a skipped delete) — never a wrong match elsewhere.
-    """
-
-    def test_oldest_records_are_evicted_at_the_cap(self):
-        """A chat over the cap keeps only the newest ``maxlen`` records."""
-        buf = buffer_mod().ChatBuffer(maxlen=3)
-        for offset in range(4):
-            buf.record(CHAT_A, 1 + offset, 100 + offset, D1, f"m{offset}", None, None)
-
-        assert buf.find_and_take(CHAT_A, D1, "m0", None, None, 100) is None, (
-            "the record evicted by the cap must not be found"
-        )
-        assert buf.find_and_take(CHAT_A, D1, "m3", None, None, 103) == 4, (
-            "the newest record must survive the cap"
-        )
-        assert buf.find_and_take(CHAT_A, D1, "m1", None, None, 101) == 2, (
-            "records inside the cap are untouched"
-        )
-
-    def test_the_cap_is_per_chat(self):
-        """Each chat keeps up to ``maxlen`` records of its own."""
-        buf = buffer_mod().ChatBuffer(maxlen=2)
-        buf.record(CHAT_A, 1, 1, D1, "a1", None, None)
-        buf.record(CHAT_A, 2, 1, D1, "a2", None, None)
-        buf.record(CHAT_A, 3, 1, D1, "a3", None, None)
-        buf.record(CHAT_B, 5, 2, D1, "b1", None, None)
-
-        assert buf.find_and_take(CHAT_A, D1, "a1", None, None, 1) is None, (
-            "chat A is at its cap: its oldest record is evicted"
-        )
-        assert buf.find_and_take(CHAT_A, D1, "a3", None, None, 1) == 3
-        assert buf.find_and_take(CHAT_B, D1, "b1", None, None, 2) == 5, (
-            "chat B is below the cap: unaffected by chat A's overflow"
-        )
-
-
-class TestSingleton:
-    """The module-level singleton shared by the handlers."""
-
-    def test_buffer_is_a_chat_buffer_instance(self):
-        """``bot.buffer.buffer`` is a ``ChatBuffer()`` — what the handlers use."""
-        mod = buffer_mod()
-
-        assert isinstance(mod.buffer, mod.ChatBuffer), (
-            "bot.buffer must expose the singleton buffer = ChatBuffer()"
-        )
-
-
-class TestSenderAndCaptionPredicate:
-    """The 6-argument ``find_and_take`` predicate (security review F2).
-
-    A date plus a text is not a unique identity: the lookup must pin the
-    ORIGINAL. The forward origin carries the sender (``sender_user.id``
-    / ``sender_chat.id``), the record carries the author (``user_id``),
-    and a captioned media original is identified by its CAPTION — the
-    ``file_unique_id`` only stays the fallback when neither a text nor
-    a caption is queried (BRIEF step 5). An unknown sender on EITHER
-    side skips the sender condition, so lookups of senderless origins
-    and records keep behaving exactly as before.
-    """
-
-    def test_find_and_take_takes_the_sender_as_the_sixth_argument(self):
-        """The signature itself: ``sender_id`` after ``file_unique_id``."""
-        params = list(inspect.signature(buffer_mod().ChatBuffer.find_and_take).parameters)
-
-        assert params == [
+        lookup_params = list(inspect.signature(buffer_mod().ChatBuffer.find_and_take).parameters)
+        assert lookup_params == [
             "self",
             "chat_id",
             "date",
@@ -339,88 +436,23 @@ class TestSenderAndCaptionPredicate:
             "caption",
             "file_unique_id",
             "sender_id",
-        ], f"the cleanup lookup must take the forward-origin sender: {params!r}"
+        ], f"the cleanup lookup must take the forward-origin sender: {lookup_params!r}"
 
-    def test_equal_sender_finds_the_record(self):
-        """Same date, text and author → the original is found (the sender is part of identity)."""
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
+    def test_record_and_find_and_take_are_coroutine_functions(self):
+        """The buffer speaks to the database: both methods must be awaited."""
+        chat_buffer = buffer_mod().ChatBuffer
 
-        assert buf.find_and_take(CHAT_A, D1, TEXT, None, None, 100) == 10
-
-    def test_the_same_date_and_text_of_another_sender_is_a_miss(self):
-        """(F2) date + text equal, sender differs → ``None`` — never a wrong delete.
-
-        Another author means another original: two messages of the same
-        second with the same text still must not resolve to each other.
-        """
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
-
-        assert buf.find_and_take(CHAT_A, D1, TEXT, None, None, 200) is None, (
-            "a message of another author is a different original"
+        assert inspect.iscoroutinefunction(chat_buffer.record), (
+            "record must be an async method (item 3: writes to the database)"
+        )
+        assert inspect.iscoroutinefunction(chat_buffer.find_and_take), (
+            "find_and_take must be an async method (item 3: reads the database)"
         )
 
-    def test_an_unknown_sender_on_the_lookup_side_skips_the_condition(self):
-        """The forward origin hides its sender → the lookup behaves as before (F2 3v)."""
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, None, None)
+    def test_buffer_is_the_module_singleton(self):
+        """``bot.buffer.buffer`` is a ``ChatBuffer()`` — what the handlers use."""
+        mod = buffer_mod()
 
-        assert buf.find_and_take(CHAT_A, D1, TEXT, None, None, None) == 10
-
-    def test_an_unknown_sender_on_the_record_side_skips_the_condition(self):
-        """A record without an author stays findable — the condition needs both sides."""
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, None, D1, TEXT, None, None)
-
-        assert buf.find_and_take(CHAT_A, D1, TEXT, None, None, 42) == 10
-
-    def test_a_media_original_matches_by_its_caption(self):
-        """Caption possession: same caption, DIFFERENT file ids → found and consumed.
-
-        A forwarded photo keeps the caption of the original while the
-        forward carries its own ``file_unique_id`` — date + caption
-        identifies the original; the file id stays the fallback for
-        media without a caption.
-        """
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, None, "photo caption", "f-uploaded")
-
-        assert buf.find_and_take(CHAT_A, D1, None, "photo caption", "f-forward", 100) == 10, (
-            "the caption, not the file id, identifies a captioned original"
+        assert isinstance(mod.buffer, mod.ChatBuffer), (
+            "bot.buffer must expose the singleton buffer = ChatBuffer()"
         )
-        assert buf.find_and_take(CHAT_A, D1, None, "photo caption", "f-forward", 100) is None, (
-            "the found record is consumed like every other match"
-        )
-
-    def test_a_differing_caption_is_a_miss_even_with_equal_file_ids(self):
-        """A non-empty caption switches the lookup to the caption branch (over the file id)."""
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, None, "cap A", "f-same")
-
-        assert buf.find_and_take(CHAT_A, D1, None, "cap B", "f-same", 100) is None, (
-            "another caption is another original — the shared file id must not match it"
-        )
-
-    def test_a_caption_the_record_never_had_is_a_miss(self):
-        """Caption branch against a record without a caption: ``None`` never equals text."""
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, None, None, "f-abc")
-
-        assert buf.find_and_take(CHAT_A, D1, None, "photo caption", "f-abc", 100) is None
-
-    def test_a_non_empty_text_takes_precedence_over_caption_and_file(self):
-        """Text branch first: a differing text misses even with equal caption + file id."""
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, "photo caption", "f-abc")
-
-        assert (
-            buf.find_and_take(CHAT_A, D1, "other text", "photo caption", "f-abc", 100) is None
-        )
-
-    def test_an_equal_text_wins_over_a_differing_caption(self):
-        """Text branch first: the caption and the file id do not participate at all."""
-        buf = buffer_mod().ChatBuffer()
-        buf.record(CHAT_A, 10, 100, D1, TEXT, "photo caption", "f-abc")
-
-        assert buf.find_and_take(CHAT_A, D1, TEXT, "another caption", "f-other", 100) == 10

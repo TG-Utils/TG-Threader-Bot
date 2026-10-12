@@ -1,9 +1,11 @@
-"""Buffering router: records source-chat messages in memory (BRIEF v3, §5).
+"""Buffering router: records source-chat messages into the database (BRIEF v3, §5).
 
 The bot lives in every configured SOURCE chat and records each message
-it sees live into ``bot.buffer`` — the step-5 cleanup of the watcher
-searches that buffer for the originals of a moved batch (the Bot API
-history does not exist, so only seen messages are findable).
+it sees live through ``await buffer.record(...)`` into the
+``buffer_messages`` table (item 3: the buffer lives in the DB) — the
+step-5 cleanup of the watcher searches those rows for the originals of
+a moved batch (the Bot API history does not exist, so only seen
+messages are findable).
 
 Only chats present in the source→target registry are buffered; the
 threaded chats and strangers are refused by the FILTER — silently:
@@ -36,7 +38,7 @@ async def on_message(message: Message) -> None:
         return
     photo = getattr(message, "photo", None)
     attachment = photo[-1] if photo else None
-    buffer.record(
+    await buffer.record(
         message.chat.id,
         message.message_id,
         sender.id,

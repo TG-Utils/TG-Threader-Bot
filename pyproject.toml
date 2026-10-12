@@ -8,6 +8,9 @@ requires-python = ">=3.10"
 dependencies = [
     "aiogram>=3.13,<4",
     "pydantic-settings>=2.6",
+    "sqlalchemy[asyncio]>=2.0,<3",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
@@ -15,6 +18,8 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
     "ruff>=0.8",
+    "aiosqlite>=0.20",
+    "Babel>=2.13",
 ]
 
 [build-system]
@@ -23,6 +28,13 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["bot*"]
+
+[tool.setuptools.package-data]
+bot = [
+    "locales/*.pot",
+    "locales/*/LC_MESSAGES/*.po",
+    "locales/*/LC_MESSAGES/*.mo",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
